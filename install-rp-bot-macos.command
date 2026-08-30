@@ -17,6 +17,10 @@ readonly INSTALLER_PATH="${0:A}"
 readonly INSTALLER_DIRECTORY="${INSTALLER_PATH:h}"
 readonly DEFAULT_SUITE_ROOT="${INSTALLER_DIRECTORY}/RP Bot Suite"
 readonly USER_LAUNCHER_NAME="Lancer RP Bot.command"
+readonly PULID_LOCAL_LAUNCHER_NAME="Lancer PuLID local.command"
+readonly PULID_NETWORK_LAUNCHER_NAME="Lancer PuLID reseau.command"
+readonly UPDATER_LAUNCHER_NAME="Mettre a jour RP Bot.command"
+readonly SUITE_RUNTIME_RELATIVE="runtimes/rp-bot-suite/suite-launcher.mjs"
 readonly PULID_ENDPOINT="http://127.0.0.1:12693"
 readonly RP_BOT_PORT=8800
 readonly PULID_PORT=12693
@@ -73,7 +77,7 @@ write_user_launcher() {
       cat <<'LAUNCHER'
 readonly SUITE_ROOT="${0:A:h}"
 readonly LOCAL_MANIFEST="${SUITE_ROOT}/state/installation.json"
-readonly APPLICATION_URL="http://127.0.0.1:${PORT:-8800}"
+readonly SUITE_LAUNCHER="${SUITE_ROOT}/runtimes/rp-bot-suite/suite-launcher.mjs"
 
 die() {
   print -u2 -- "[ERREUR] $*"
@@ -109,18 +113,11 @@ backgrounds_content="${summary_lines[2]:-}"
 backgrounds_format="${summary_lines[3]:-}"
 active_path="${SUITE_ROOT}/apps/rp-bot/${active_version}"
 runtime_path="${active_path}/runtime/node"
-launcher_path="${active_path}/launcher.mjs"
 data_path="${SUITE_ROOT}/data/rp-bot"
 backgrounds_path=""
 
-[[ -x "${runtime_path}" && -f "${launcher_path}" ]] || die "Installation RP Bot ${active_version} incomplète : ${active_path}"
-/bin/mkdir -p "${data_path}"
-
-environment=("RP_BOT_DATA_DIR=${data_path}")
 if [[ -n "${backgrounds_content}" ]]; then
   backgrounds_path="${SUITE_ROOT}/assets/roleplay-backgrounds/${backgrounds_content}-format-${backgrounds_format}"
-  [[ -d "${backgrounds_path}" ]] || die "Le pack de décors actif est introuvable : ${backgrounds_path}"
-  environment+=("RP_BOT_ROLEPLAY_BACKGROUNDS_DIR=${backgrounds_path}")
 fi
 
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -130,34 +127,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit 0
 fi
 
-child_pid=""
-stop_child() {
-  [[ -z "${child_pid}" ]] || /bin/kill "${child_pid}" 2>/dev/null || true
-}
-trap stop_child INT TERM
-
-/usr/bin/env "${environment[@]}" "${runtime_path}" "${launcher_path}" &
-child_pid=$!
-browser_opened=0
-for attempt in {1..60}; do
-  if ! /bin/kill -0 "${child_pid}" 2>/dev/null; then
-    if wait "${child_pid}"; then exit 0; else exit $?; fi
-  fi
-  if /usr/bin/curl --silent --fail --max-time 1 "${APPLICATION_URL}/api/health" >/dev/null 2>&1; then
-    /usr/bin/open "${APPLICATION_URL}" >/dev/null 2>&1 || true
-    browser_opened=1
-    break
-  fi
-  /bin/sleep 0.5
-done
-(( browser_opened )) || print -u2 -- "[AVERTISSEMENT] RP Bot ne répond pas encore sur ${APPLICATION_URL}."
-if wait "${child_pid}"; then
-  child_exit=0
-else
-  child_exit=$?
-fi
-child_pid=""
-exit "${child_exit}"
+[[ -x "${runtime_path}" ]] || die "Runtime RP Bot ${active_version} introuvable : ${runtime_path}"
+[[ -f "${SUITE_LAUNCHER}" ]] || die "Lanceur de suite externe introuvable : ${SUITE_LAUNCHER}"
+exec "${runtime_path}" "${SUITE_LAUNCHER}" --suite-root "${SUITE_ROOT}" "$@"
 LAUNCHER
     } > "${temporary}"
     /bin/chmod 700 "${temporary}"
@@ -169,6 +141,187 @@ LAUNCHER
   fi
   print -- "Lanceur créé : ${launcher_path}"
   print -- "Vous pouvez déplacer le dossier RP Bot Suite complet."
+}
+
+write_updater_launcher() {
+  local destination_directory="$1"
+  local launcher_path="${destination_directory}/${UPDATER_LAUNCHER_NAME}"
+  local temporary
+  if [[ -e "${launcher_path}" ]] && {
+    [[ ! -f "${launcher_path}" ]] ||
+      ! /usr/bin/grep -q '^# RP_BOT_MANAGED_UPDATER_LAUNCHER$' "${launcher_path}"
+  }; then
+    print -u2 -- "[AVERTISSEMENT] ${launcher_path} existe déjà et n'a pas été créé par RP Bot ; il est conservé."
+    return 0
+  fi
+  temporary="$(/usr/bin/mktemp "${destination_directory}/.updater-launcher.XXXXXX")" || die "Impossible de préparer le lanceur updater."
+  {
+    print -r -- '#!/bin/zsh'
+    print -r -- '# RP_BOT_MANAGED_UPDATER_LAUNCHER'
+    cat <<'UPDATER_LAUNCHER'
+emulate -L zsh
+set -eu
+setopt pipefail
+
+readonly SUITE_ROOT="${0:A:h}"
+readonly LOCAL_MANIFEST="${SUITE_ROOT}/state/installation.json"
+readonly UPDATE_REQUEST="${SUITE_ROOT}/state/update-request.json"
+readonly UPDATER="${SUITE_ROOT}/runtimes/rp-bot-suite/suite-updater.mjs"
+
+die() {
+  print -u2 -- "[ERREUR] $*"
+  exit 1
+}
+
+active_version="$(/usr/bin/osascript -l JavaScript - "${LOCAL_MANIFEST}" <<'JXA'
+ObjC.import("Foundation");
+function run(argv) {
+  const contents = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError($(argv[0]), $.NSUTF8StringEncoding, null));
+  if (contents === undefined) throw new Error("Lecture impossible.");
+  const manifest = JSON.parse(contents);
+  const version = manifest && manifest.components && manifest.components.rpBot && manifest.components.rpBot.activeVersion;
+  if (typeof version !== "string") throw new Error("Aucune version RP Bot active.");
+  return version;
+}
+JXA
+)" || die "Le manifeste local RP Bot est invalide."
+runtime_path="${SUITE_ROOT}/apps/rp-bot/${active_version}/runtime/node"
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  print -- "Version active : ${active_version}"
+  print -- "Racine : ${SUITE_ROOT}"
+  print -- "Demande : ${UPDATE_REQUEST}"
+  print -- "Updater : ${UPDATER}"
+  exit 0
+fi
+
+[[ -x "${runtime_path}" ]] || die "Runtime RP Bot actif introuvable : ${runtime_path}"
+[[ -f "${UPDATER}" ]] || die "Updater externe introuvable : ${UPDATER}"
+[[ -f "${UPDATE_REQUEST}" ]] || die "Aucune demande préparée : ${UPDATE_REQUEST}"
+exec "${runtime_path}" "${UPDATER}" --suite-root "${SUITE_ROOT}" --request "${UPDATE_REQUEST}"
+UPDATER_LAUNCHER
+  } > "${temporary}"
+  /bin/chmod 700 "${temporary}"
+  /bin/mv -f -- "${temporary}" "${launcher_path}"
+  print -- "Lanceur créé : ${launcher_path}"
+}
+
+write_pulid_launchers() {
+  local destination_directory="$1"
+  write_pulid_launcher "${destination_directory}" "${PULID_LOCAL_LAUNCHER_NAME}" local ""
+  write_pulid_launcher "${destination_directory}" "${PULID_NETWORK_LAUNCHER_NAME}" reseau "--network"
+}
+
+write_pulid_launcher() {
+    local destination_directory="$1" launcher_name="$2" launch_mode="$3" network_argument="$4"
+    local launcher_path temporary
+    launcher_path="${destination_directory}/${launcher_name}"
+    if [[ -e "${launcher_path}" ]] && {
+      [[ ! -f "${launcher_path}" ]] ||
+        ! /usr/bin/grep -q '^# RP_BOT_MANAGED_PULID_LAUNCHER$' "${launcher_path}"
+    }; then
+      print -u2 -- "[AVERTISSEMENT] ${launcher_path} existe déjà et n'a pas été créé par RP Bot ; il est conservé."
+      return 0
+    fi
+    temporary="$(/usr/bin/mktemp "${destination_directory}/.pulid-launcher.XXXXXX")" || die "Impossible de préparer ${launcher_name}."
+    {
+      print -r -- '#!/bin/zsh'
+      print -r -- '# RP_BOT_MANAGED_PULID_LAUNCHER'
+      print -r -- ''
+      print -r -- 'emulate -L zsh'
+      print -r -- 'set -eu'
+      print -r -- 'setopt pipefail'
+      print -r -- "readonly PULID_LAUNCH_MODE=\"${launch_mode}\""
+      print -r -- "readonly PULID_NETWORK_ARGUMENT=\"${network_argument}\""
+      cat <<'PULID_LAUNCHER'
+readonly SUITE_ROOT="${0:A:h}"
+readonly LOCAL_MANIFEST="${SUITE_ROOT}/state/installation.json"
+
+die() {
+  print -u2 -- "[ERREUR] $*"
+  exit 1
+}
+
+[[ -f "${LOCAL_MANIFEST}" ]] || die "Installation PuLID introuvable : ${LOCAL_MANIFEST}"
+summary="$(/usr/bin/osascript -l JavaScript - "${LOCAL_MANIFEST}" <<'JXA'
+ObjC.import("Foundation");
+function run(argv) {
+  const contents = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError($(argv[0]), $.NSUTF8StringEncoding, null));
+  if (contents === undefined) throw new Error("Lecture impossible.");
+  const manifest = JSON.parse(contents);
+  const pulid = manifest && manifest.components && manifest.components.pulid;
+  const managed = pulid && pulid.installationType === "managed-local" && pulid.managedInstallation;
+  const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  if (!managed || !semver.test(managed.activeVersion) || typeof pulid.modelsPath !== "string" || pulid.modelsPath.length === 0) {
+    throw new Error("Aucune version PuLID locale gérée n'est active.");
+  }
+  return managed.activeVersion + "\n" + pulid.modelsPath;
+}
+JXA
+)" || die "Le manifeste local PuLID est invalide."
+summary_lines=("${(@f)summary}")
+active_version="${summary_lines[1]:-}"
+models_path="${summary_lines[2]:-}"
+release_path="${SUITE_ROOT}/apps/pulid/${active_version}"
+start_path="${release_path}/start_pulid_server.sh"
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  print -- "Version active : ${active_version}"
+  print -- "Racine : ${SUITE_ROOT}"
+  print -- "Modèles : ${models_path}"
+  print -- "Mode : ${PULID_LAUNCH_MODE}"
+  exit 0
+fi
+
+[[ -f "${start_path}" ]] || die "Lanceur PuLID actif introuvable : ${start_path}"
+if [[ "${PULID_LAUNCH_MODE}" == "local" ]]; then
+  for argument in "$@"; do
+    [[ "${argument}" != "--network" ]] || die "Le mode réseau est réservé au lanceur PuLID réseau."
+  done
+  exec /usr/bin/env "PULID_MODELS_ROOT=${models_path}" /bin/bash "${start_path}" "$@"
+fi
+
+print -- "[AVERTISSEMENT] Mode réseau avancé : PuLID écoutera sur le LAN."
+print -- "Limitez le port 12693 à un réseau de confiance dans le pare-feu macOS."
+for interface in en0 en1; do
+  address="$(/usr/sbin/ipconfig getifaddr "${interface}" 2>/dev/null || true)"
+  [[ -z "${address}" ]] || print -- "  http://${address}:12693"
+done
+exec /usr/bin/env "PULID_MODELS_ROOT=${models_path}" /bin/bash "${start_path}" "${PULID_NETWORK_ARGUMENT}" "$@"
+PULID_LAUNCHER
+    } > "${temporary}"
+    /bin/chmod 700 "${temporary}"
+    /bin/mv -f -- "${temporary}" "${launcher_path}"
+    print -- "Lanceur créé : ${launcher_path}"
+}
+
+prepare_permanent_directories() {
+  local relative_path
+  for relative_path in \
+    apps/rp-bot apps/pulid assets/roleplay-backgrounds runtimes/rp-bot-suite \
+    state state/downloads state/backups/rp-bot logs logs/rp-bot logs/pulid data/rp-bot; do
+    /bin/mkdir -p "${SUITE_ROOT}/${relative_path}" || die "Impossible de créer ${SUITE_ROOT}/${relative_path}."
+    /bin/chmod 700 "${SUITE_ROOT}/${relative_path}" 2>/dev/null || true
+  done
+}
+
+install_suite_runtime() {
+  local release_root="$1"
+  local destination_directory="${SUITE_ROOT}/runtimes/rp-bot-suite"
+  local file_name source_path destination_path temporary
+  /bin/mkdir -p "${destination_directory}"
+  for file_name in suite-launcher.mjs suite-updater.mjs safe-extract-windows.ps1; do
+    source_path="${release_root}/suite-runtime/${file_name}"
+    destination_path="${destination_directory}/${file_name}"
+    [[ -f "${source_path}" ]] || die "L'artefact RP Bot ne contient pas ${file_name}."
+    temporary="$(/usr/bin/mktemp "${destination_directory}/.${file_name}.XXXXXX")" || die "Impossible de préparer ${file_name}."
+    /bin/cp -- "${source_path}" "${temporary}" || {
+      /bin/rm -f -- "${temporary}"
+      die "Impossible de copier ${file_name}."
+    }
+    /bin/chmod 600 "${temporary}"
+    /bin/mv -f -- "${temporary}" "${destination_path}"
+  done
 }
 
 cleanup() {
@@ -969,10 +1122,12 @@ install_rp_bot() {
   extract_archive "${archive}" "${staging}" rp-bot
   single_archive_root "${staging}"; prepared="${REPLY}"
   [[ -x "${prepared}/runtime/node" && -f "${prepared}/launcher.mjs" && -f "${prepared}/metadata/build.json" ]] || die "Artefact RP Bot incomplet."
+  [[ -f "${prepared}/suite-runtime/suite-launcher.mjs" && -f "${prepared}/suite-runtime/suite-updater.mjs" && -f "${prepared}/suite-runtime/safe-extract-windows.ps1" ]] || die "Artefact RP Bot incomplet : runtime externe de suite absent."
   actual="$(json_helper build-version "${prepared}/metadata/build.json")"
   [[ "${actual}" == "${version}" ]] || die "L'artefact RP Bot contient la version ${actual}, ${version} attendue."
   target="${SUITE_ROOT}/apps/rp-bot/${version}"
   swap_in_directory "${prepared}" "${target}" "${staging}"
+  install_suite_runtime "${target}"
   atomic_local_update activate-rp "${version}" "${target}"
   commit_swap
   atomic_local_update clear-operation
@@ -1104,7 +1259,7 @@ run_self_test() {
     [[ "$(print -r -- "${pointer_summary}" | /usr/bin/plutil -extract suiteVersion raw -o - -)" == "0.2.0-beta.1" ]] || die "Self-test pointeur en échec."
     [[ "$(print -r -- "${manifest_summary}" | /usr/bin/plutil -extract rpBotVersion raw -o - -)" == "0.2.0-beta.1" ]] || die "Self-test manifeste en échec."
   fi
-  local state_base state_root local_path now previous_suite_root previous_state_directory previous_local_manifest launcher_path launcher_output moved_root moved_launcher backgrounds_path moved_backgrounds_path
+  local state_base state_root local_path now previous_suite_root previous_state_directory previous_local_manifest launcher_path launcher_output moved_root moved_launcher backgrounds_path moved_backgrounds_path pulid_local_launcher pulid_network_launcher updater_launcher
   state_base="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/rp-bot-installer-state-test.XXXXXX")"
   state_root="${state_base}/RP Bot Suite test"
   /bin/mkdir -p "${state_root}"
@@ -1121,24 +1276,43 @@ run_self_test() {
   now="2026-09-15T12:00:00.000Z"
   atomic_local_update operation self-test-operation rp-bot install downloading - 0.2.0-beta.1 "Téléchargement RP Bot en cours." resume,cancel
   atomic_local_update activate-rp 0.2.0-beta.1 "${state_root}/apps/rp-bot/0.2.0-beta.1"
+  atomic_local_update activate-pulid 0.1.0 "${state_root}/apps/pulid/0.1.0" "${state_root}/models/PuLID_models"
   backgrounds_path="${state_root}/assets/roleplay-backgrounds/1.0.0-format-1.0.0"
   atomic_local_update activate-backgrounds 1.0.0 1.0.0 "${backgrounds_path}"
   [[ "$(json_helper local-summary "${local_path}" "${state_root}" beta | /usr/bin/plutil -extract rpBotVersion raw -o - -)" == "0.2.0-beta.1" ]] || die "Self-test manifeste local en échec."
   /bin/mkdir -p "${state_root}/apps/rp-bot/0.2.0-beta.1/runtime" "${backgrounds_path}"
   print -n -- 'self-test' > "${state_root}/apps/rp-bot/0.2.0-beta.1/launcher.mjs"
+  /bin/mkdir -p "${state_root}/apps/pulid/0.1.0" "${state_root}/models/PuLID_models"
+  print -r -- '#!/usr/bin/env bash' > "${state_root}/apps/pulid/0.1.0/start_pulid_server.sh"
   print -r -- '#!/bin/sh' > "${state_root}/apps/rp-bot/0.2.0-beta.1/runtime/node"
   /bin/chmod 700 "${state_root}/apps/rp-bot/0.2.0-beta.1/runtime/node"
   write_user_launcher "${state_root}"
+  write_updater_launcher "${state_root}"
+  write_pulid_launchers "${state_root}"
   launcher_path="${state_root}/${USER_LAUNCHER_NAME}"
   [[ -x "${launcher_path}" ]] || die "Self-test création du lanceur portable en échec."
   launcher_output="$("${launcher_path}" --self-test)"
   [[ "${launcher_output}" == *"Version active : 0.2.0-beta.1"* && "${launcher_output}" == *"Données : ${state_root}/data/rp-bot"* && "${launcher_output}" == *"Décors : ${backgrounds_path}"* ]] || die "Self-test contenu du lanceur portable en échec."
+  updater_launcher="${state_root}/${UPDATER_LAUNCHER_NAME}"
+  launcher_output="$("${updater_launcher}" --self-test)"
+  [[ "${launcher_output}" == *"Version active : 0.2.0-beta.1"* && "${launcher_output}" == *"Demande : ${state_root}/state/update-request.json"* ]] || die "Self-test lanceur updater macOS en échec."
+  pulid_local_launcher="${state_root}/${PULID_LOCAL_LAUNCHER_NAME}"
+  pulid_network_launcher="${state_root}/${PULID_NETWORK_LAUNCHER_NAME}"
+  [[ -x "${pulid_local_launcher}" && -x "${pulid_network_launcher}" ]] || die "Self-test création des lanceurs PuLID macOS en échec."
+  launcher_output="$("${pulid_local_launcher}" --self-test)"
+  [[ "${launcher_output}" == *"Version active : 0.1.0"* && "${launcher_output}" == *"Mode : local"* ]] || die "Self-test lanceur PuLID local macOS en échec."
+  launcher_output="$("${pulid_network_launcher}" --self-test)"
+  [[ "${launcher_output}" == *"Version active : 0.1.0"* && "${launcher_output}" == *"Mode : reseau"* ]] || die "Self-test lanceur PuLID réseau macOS en échec."
   moved_root="${state_base}/RP Bot Suite déplacée"
   /bin/cp -R -- "${state_root}" "${moved_root}"
   moved_launcher="${moved_root}/${USER_LAUNCHER_NAME}"
   moved_backgrounds_path="${moved_root}/assets/roleplay-backgrounds/1.0.0-format-1.0.0"
   launcher_output="$("${moved_launcher}" --self-test)"
   [[ "${launcher_output}" == *"Version active : 0.2.0-beta.1"* && "${launcher_output}" == *"Données : ${moved_root}/data/rp-bot"* && "${launcher_output}" == *"Décors : ${moved_backgrounds_path}"* ]] || die "Self-test déplacement de la suite portable en échec."
+  launcher_output="$("${moved_root}/${PULID_NETWORK_LAUNCHER_NAME}" --self-test)"
+  [[ "${launcher_output}" == *"Racine : ${moved_root}"* && "${launcher_output}" == *"Mode : reseau"* ]] || die "Self-test déplacement du lanceur PuLID réseau macOS en échec."
+  launcher_output="$("${moved_root}/${UPDATER_LAUNCHER_NAME}" --self-test)"
+  [[ "${launcher_output}" == *"Racine : ${moved_root}"* && "${launcher_output}" == *"Demande : ${moved_root}/state/update-request.json"* ]] || die "Self-test déplacement du lanceur updater macOS en échec."
   SUITE_ROOT="${previous_suite_root}"
   STATE_DIRECTORY="${previous_state_directory}"
   LOCAL_MANIFEST="${previous_local_manifest}"
@@ -1200,8 +1374,7 @@ main() {
   STATE_DIRECTORY="${SUITE_ROOT}/state"
   DOWNLOAD_DIRECTORY="${STATE_DIRECTORY}/downloads"
   LOCAL_MANIFEST="${STATE_DIRECTORY}/installation.json"
-  /bin/mkdir -p "${STATE_DIRECTORY}" "${DOWNLOAD_DIRECTORY}"
-  /bin/chmod 700 "${STATE_DIRECTORY}" "${DOWNLOAD_DIRECTORY}" 2>/dev/null || true
+  prepare_permanent_directories
   print -- "Dossier de suite : ${SUITE_ROOT}"
 
   notice "Lecture du canal ${CHANNEL}"
@@ -1299,6 +1472,12 @@ main() {
   installed_rp="$(json_helper local-summary "${LOCAL_MANIFEST}" "${SUITE_ROOT}" "${CHANNEL}" | /usr/bin/plutil -extract rpBotVersion raw -o - -)"
   if [[ -n "${installed_rp}" ]]; then
     write_user_launcher "${SUITE_ROOT}"
+    write_updater_launcher "${SUITE_ROOT}"
+  fi
+  local installed_pulid_type
+  installed_pulid_type="$(json_helper local-summary "${LOCAL_MANIFEST}" "${SUITE_ROOT}" "${CHANNEL}" | /usr/bin/plutil -extract pulidInstallationType raw -o - -)"
+  if [[ "${installed_pulid_type}" == "managed-local" ]]; then
+    write_pulid_launchers "${SUITE_ROOT}"
   fi
 
   notice "Installation terminée"

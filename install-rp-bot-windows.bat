@@ -45,6 +45,10 @@ $script:PublicRawBase = "https://raw.githubusercontent.com/$($script:PublicRepos
 $script:UserLauncherName = "Lancer RP Bot.bat"
 $script:PuLIDLocalLauncherName = "Lancer PuLID local.bat"
 $script:PuLIDNetworkLauncherName = "Lancer PuLID reseau.bat"
+$script:UpdaterLauncherName = "Mettre a jour RP Bot.bat"
+$script:SuiteRuntimeDirectory = Join-Path $Root "runtimes\rp-bot-suite"
+$script:SuiteLauncherPath = Join-Path $script:SuiteRuntimeDirectory "suite-launcher.mjs"
+$script:LauncherManifestReaderName = "read-active-version.ps1"
 $script:StateDirectory = Join-Path $Root "state"
 $script:DownloadDirectory = Join-Path $script:StateDirectory "downloads"
 $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
@@ -58,6 +62,105 @@ function Fail([string]$Message) {
 function Write-Section([string]$Message) {
     Write-Host ""
     Write-Host "==> $Message" -ForegroundColor Cyan
+}
+
+function Initialize-PermanentDirectories {
+    foreach ($relativePath in @(
+        "apps\rp-bot", "apps\pulid", "assets\roleplay-backgrounds",
+        "runtimes\rp-bot-suite", "state", "state\downloads",
+        "state\backups\rp-bot", "logs", "logs\rp-bot", "logs\pulid",
+        "data\rp-bot"
+    )) {
+        New-Item -ItemType Directory -Path (Join-Path $Root $relativePath) -Force | Out-Null
+    }
+    $dataDirectory = Join-Path $Root "data\rp-bot"
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $icacls = Join-Path $env:SystemRoot "System32\icacls.exe"
+    $aclOutput = @(& $icacls $dataDirectory "/inheritance:r" "/grant:r" "${currentIdentity}:(OI)(CI)F" "/grant:r" "*S-1-5-18:(OI)(CI)F" 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("Impossible de limiter les ACL de $dataDirectory sur ce volume. " + ($aclOutput -join " "))
+    }
+}
+
+function Install-SuiteRuntime([string]$ReleaseRoot) {
+    New-Item -ItemType Directory -Path $script:SuiteRuntimeDirectory -Force | Out-Null
+    foreach ($fileName in @("suite-launcher.mjs", "suite-updater.mjs", "safe-extract-windows.ps1")) {
+        $sourcePath = Join-Path $ReleaseRoot ("suite-runtime\" + $fileName)
+        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { Fail "L'artefact RP Bot ne contient pas $fileName." }
+        $destinationPath = Join-Path $script:SuiteRuntimeDirectory $fileName
+        $temporary = Join-Path $script:SuiteRuntimeDirectory (".{0}.{1}.tmp" -f $fileName, [Guid]::NewGuid())
+        $backup = Join-Path $script:SuiteRuntimeDirectory (".{0}.{1}.bak" -f $fileName, [Guid]::NewGuid())
+        try {
+            Copy-Item -LiteralPath $sourcePath -Destination $temporary
+            if (Test-Path -LiteralPath $destinationPath) {
+                [IO.File]::Replace($temporary, $destinationPath, $backup, $true)
+                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            }
+            else { [IO.File]::Move($temporary, $destinationPath) }
+        }
+        finally {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Write-LauncherManifestReader([string]$SuiteRoot) {
+    $runtimeDirectory = Join-Path $SuiteRoot "runtimes\rp-bot-suite"
+    New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
+    $readerPath = Join-Path $runtimeDirectory $script:LauncherManifestReaderName
+    $contents = @'
+# RP_BOT_MANAGED_MANIFEST_READER
+#requires -Version 5.1
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ManifestPath,
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("rp-bot", "pulid")]
+    [string]$Component
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+try {
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($Component -eq "rp-bot") {
+        $version = [string]$manifest.components.rpBot.activeVersion
+    }
+    else {
+        $pulid = $manifest.components.pulid
+        if ($null -eq $pulid -or [string]$pulid.installationType -ne "managed-local" -or $null -eq $pulid.managedInstallation) {
+            throw "Managed local PuLID is not installed."
+        }
+        $version = [string]$pulid.managedInstallation.activeVersion
+    }
+    if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
+        throw "The active component version is not valid SemVer."
+    }
+    [Console]::Out.WriteLine($version)
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+'@
+    $temporary = Join-Path $runtimeDirectory (".{0}.{1}.tmp" -f $script:LauncherManifestReaderName, [Guid]::NewGuid())
+    $backup = Join-Path $runtimeDirectory (".{0}.{1}.bak" -f $script:LauncherManifestReaderName, [Guid]::NewGuid())
+    try {
+        [IO.File]::WriteAllText($temporary, $contents, (New-Object Text.UTF8Encoding($true)))
+        if (Test-Path -LiteralPath $readerPath) {
+            [IO.File]::Replace($temporary, $readerPath, $backup, $true)
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        }
+        else { [IO.File]::Move($temporary, $readerPath) }
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Assert-ExactProperties($Value, [string[]]$Expected, [string]$Label) {
@@ -641,10 +744,11 @@ function Install-RpBot($Manifest, [string]$CurrentVersion) {
     Set-InterruptedOperation $kind "rp-bot" "installing" $CurrentVersion $version "Artefact RP Bot vérifié ; extraction en cours."
     $staging = Join-Path $Root ("apps\rp-bot\.staging." + [Guid]::NewGuid()); Expand-SafeArchive $archive $staging
     $prepared = Get-SingleArchiveRoot $staging
-    foreach ($required in @("runtime\node.exe", "launcher.mjs", "metadata\build.json")) { if (-not (Test-Path -LiteralPath (Join-Path $prepared $required) -PathType Leaf)) { Fail "Artefact RP Bot incomplet : $required" } }
+    foreach ($required in @("runtime\node.exe", "launcher.mjs", "suite-runtime\suite-launcher.mjs", "suite-runtime\suite-updater.mjs", "suite-runtime\safe-extract-windows.ps1", "metadata\build.json")) { if (-not (Test-Path -LiteralPath (Join-Path $prepared $required) -PathType Leaf)) { Fail "Artefact RP Bot incomplet : $required" } }
     $buildVersion = Read-RpBotBuildVersion (Join-Path $prepared "metadata\build.json")
     if ($buildVersion -ne $version) { Fail "Version interne de l'artefact RP Bot invalide : $buildVersion, attendu $version." }
     $target = Join-Path $Root "apps\rp-bot\$version"; Start-DirectorySwap $prepared $target $staging
+    Install-SuiteRuntime $target
     Activate-RpBot $version $target; Complete-DirectorySwap; Clear-InterruptedOperation
     Write-Host "RP Bot $version installé et activé sans modifier les données utilisateur."
 }
@@ -708,15 +812,8 @@ function Write-UserLauncher([string]$SuiteRoot, $Local) {
     if ($null -eq $Local.components.rpBot) { return }
     $version = [string]$Local.components.rpBot.activeVersion
     Assert-SemVer $version "Lanceur RP Bot.version"
-    $backgroundsSuffix = $null
-    if ($null -ne $Local.components.roleplayBackgrounds) {
-        $content = [string]$Local.components.roleplayBackgrounds.activeContentVersion
-        $format = [string]$Local.components.roleplayBackgrounds.activeFormatVersion
-        Assert-SemVer $content "Lanceur RP Bot.backgrounds.contentVersion"
-        Assert-SemVer $format "Lanceur RP Bot.backgrounds.formatVersion"
-        $backgroundsSuffix = "assets\roleplay-backgrounds\$content-format-$format"
-    }
     New-Item -ItemType Directory -Path $SuiteRoot -Force | Out-Null
+    Write-LauncherManifestReader $SuiteRoot
     $launcherPath = Join-Path $SuiteRoot $script:UserLauncherName
     if (Test-Path -LiteralPath $launcherPath) {
         $existing = [IO.File]::ReadAllText($launcherPath)
@@ -725,31 +822,39 @@ function Write-UserLauncher([string]$SuiteRoot, $Local) {
             return
         }
     }
-    $backgroundsLine = if ($backgroundsSuffix) {
-        'set "RP_BOT_ROLEPLAY_BACKGROUNDS_DIR=%~dp0' + $backgroundsSuffix + '"'
-    }
-    else { 'set "RP_BOT_ROLEPLAY_BACKGROUNDS_DIR="' }
     $lines = @(
         '@echo off',
         'rem RP_BOT_MANAGED_LAUNCHER',
         'setlocal EnableExtensions DisableDelayedExpansion',
+        'set "RP_BOT_MANIFEST=%~dp0state\installation.json"',
+        'set "RP_BOT_MANIFEST_READER=%~dp0runtimes\rp-bot-suite\read-active-version.ps1"',
+        'if not exist "%RP_BOT_MANIFEST%" (',
+        '  echo [ERREUR] Installation RP Bot introuvable : %RP_BOT_MANIFEST%',
+        '  exit /b 1',
+        ')',
+        'if not exist "%RP_BOT_MANIFEST_READER%" ( echo [ERREUR] Lecteur du manifeste introuvable. & exit /b 1 )',
+        'for /f "usebackq delims=" %%V in (`powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%RP_BOT_MANIFEST_READER%" -ManifestPath "%RP_BOT_MANIFEST%" -Component rp-bot`) do set "RP_BOT_ACTIVE_VERSION=%%V"',
+        'if not defined RP_BOT_ACTIVE_VERSION (',
+        '  echo [ERREUR] Aucune version RP Bot active dans le manifeste local.',
+        '  exit /b 1',
+        ')',
         'set "RP_BOT_DATA_DIR=%~dp0data\rp-bot"',
-        $backgroundsLine,
-        ('set "RP_BOT_ACTIVE_VERSION=' + $version + '"'),
         'if /i "%~1"=="--self-test" (',
         '  echo Version active : %RP_BOT_ACTIVE_VERSION%',
         '  echo Racine : %~dp0',
         '  echo Donnees : %RP_BOT_DATA_DIR%',
-        '  echo Decors : %RP_BOT_ROLEPLAY_BACKGROUNDS_DIR%',
+        '  echo Decors : resolution portable par le lanceur de suite',
         '  exit /b 0',
         ')',
-        'if not exist "%RP_BOT_DATA_DIR%" mkdir "%RP_BOT_DATA_DIR%"',
         'if not exist "%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\runtime\node.exe" (',
         '  echo [ERREUR] Installation RP Bot incomplete dans %~dp0',
         '  exit /b 1',
         ')',
-        'start "" /b powershell.exe -NoLogo -NoProfile -Command "$url=''http://127.0.0.1:8800'';for($attempt=0;$attempt -lt 60;$attempt++){try{$response=Invoke-WebRequest -UseBasicParsing -Uri ($url + ''/api/health'') -TimeoutSec 1;if($response.StatusCode -eq 200){Start-Process $url;exit 0}}catch{};Start-Sleep -Milliseconds 500}" >nul 2>&1',
-        '"%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\runtime\node.exe" "%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\launcher.mjs"',
+        'if not exist "%~dp0runtimes\rp-bot-suite\suite-launcher.mjs" (',
+        '  echo [ERREUR] Lanceur de suite externe introuvable.',
+        '  exit /b 1',
+        ')',
+        '"%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\runtime\node.exe" "%~dp0runtimes\rp-bot-suite\suite-launcher.mjs" --suite-root "%~dp0." %*',
         'exit /b %ERRORLEVEL%',
         ''
     )
@@ -771,6 +876,61 @@ function Write-UserLauncher([string]$SuiteRoot, $Local) {
     Write-Host "Vous pouvez déplacer le dossier RP Bot Suite complet."
 }
 
+function Write-UpdaterLauncher([string]$SuiteRoot, $Local) {
+    if ($null -eq $Local.components.rpBot) { return }
+    Assert-SemVer ([string]$Local.components.rpBot.activeVersion) "Lanceur updater.version"
+    Write-LauncherManifestReader $SuiteRoot
+    $launcherPath = Join-Path $SuiteRoot $script:UpdaterLauncherName
+    if (Test-Path -LiteralPath $launcherPath) {
+        $existing = [IO.File]::ReadAllText($launcherPath)
+        if (-not $existing.Contains("rem RP_BOT_MANAGED_UPDATER_LAUNCHER")) {
+            Write-Warning "$launcherPath existe déjà et n'a pas été créé par RP Bot ; il est conservé."
+            return
+        }
+    }
+    $lines = @(
+        '@echo off',
+        'rem RP_BOT_MANAGED_UPDATER_LAUNCHER',
+        'setlocal EnableExtensions DisableDelayedExpansion',
+        'set "RP_BOT_MANIFEST=%~dp0state\installation.json"',
+        'set "RP_BOT_MANIFEST_READER=%~dp0runtimes\rp-bot-suite\read-active-version.ps1"',
+        'set "RP_BOT_UPDATE_REQUEST=%~dp0state\update-request.json"',
+        'set "RP_BOT_UPDATER=%~dp0runtimes\rp-bot-suite\suite-updater.mjs"',
+        'if not exist "%RP_BOT_MANIFEST%" ( echo [ERREUR] Manifeste local introuvable. & exit /b 1 )',
+        'if not exist "%RP_BOT_MANIFEST_READER%" ( echo [ERREUR] Lecteur du manifeste introuvable. & exit /b 1 )',
+        'for /f "usebackq delims=" %%V in (`powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%RP_BOT_MANIFEST_READER%" -ManifestPath "%RP_BOT_MANIFEST%" -Component rp-bot`) do set "RP_BOT_ACTIVE_VERSION=%%V"',
+        'if not defined RP_BOT_ACTIVE_VERSION ( echo [ERREUR] Aucune version RP Bot active. & exit /b 1 )',
+        'if /i "%~1"=="--self-test" (',
+        '  echo Version active : %RP_BOT_ACTIVE_VERSION%',
+        '  echo Racine : %~dp0',
+        '  echo Demande : %RP_BOT_UPDATE_REQUEST%',
+        '  echo Updater : %RP_BOT_UPDATER%',
+        '  exit /b 0',
+        ')',
+        'if not exist "%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\runtime\node.exe" ( echo [ERREUR] Runtime RP Bot actif introuvable. & exit /b 1 )',
+        'if not exist "%RP_BOT_UPDATER%" ( echo [ERREUR] Updater externe introuvable. & exit /b 1 )',
+        'if not exist "%RP_BOT_UPDATE_REQUEST%" ( echo [ERREUR] Aucune demande de mise a jour preparee. & exit /b 1 )',
+        '"%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\runtime\node.exe" "%RP_BOT_UPDATER%" --suite-root "%~dp0." --request "%RP_BOT_UPDATE_REQUEST%"',
+        'exit /b %ERRORLEVEL%',
+        ''
+    )
+    $temporary = Join-Path $SuiteRoot (".updater-launcher.{0}.tmp" -f [Guid]::NewGuid())
+    $backup = Join-Path $SuiteRoot (".updater-launcher.{0}.bak" -f [Guid]::NewGuid())
+    try {
+        [IO.File]::WriteAllText($temporary, ($lines -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $launcherPath) {
+            [IO.File]::Replace($temporary, $launcherPath, $backup, $true)
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        }
+        else { [IO.File]::Move($temporary, $launcherPath) }
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "Lanceur créé : $launcherPath"
+}
+
 function Write-PuLIDLaunchers([string]$SuiteRoot, $Local) {
     if ($null -eq $Local.components.pulid -or
         [string]$Local.components.pulid.installationType -ne "managed-local" -or
@@ -778,6 +938,7 @@ function Write-PuLIDLaunchers([string]$SuiteRoot, $Local) {
     $version = [string]$Local.components.pulid.managedInstallation.activeVersion
     Assert-SemVer $version "Lanceur PuLID.version"
     New-Item -ItemType Directory -Path $SuiteRoot -Force | Out-Null
+    Write-LauncherManifestReader $SuiteRoot
 
     foreach ($launcher in @(
         [pscustomobject]@{ Name = $script:PuLIDLocalLauncherName; Mode = "local"; NetworkArgument = "" },
@@ -795,8 +956,19 @@ function Write-PuLIDLaunchers([string]$SuiteRoot, $Local) {
             '@echo off',
             'rem RP_BOT_MANAGED_PULID_LAUNCHER',
             'setlocal EnableExtensions DisableDelayedExpansion',
-            ('set "PULID_ACTIVE_VERSION=' + $version + '"'),
             ('set "PULID_LAUNCH_MODE=' + $launcher.Mode + '"'),
+            'set "PULID_MANIFEST=%~dp0state\installation.json"',
+            'set "PULID_MANIFEST_READER=%~dp0runtimes\rp-bot-suite\read-active-version.ps1"',
+            'if not exist "%PULID_MANIFEST%" (',
+            '  echo [ERREUR] Installation PuLID introuvable : %PULID_MANIFEST%',
+            '  exit /b 1',
+            ')',
+            'if not exist "%PULID_MANIFEST_READER%" ( echo [ERREUR] Lecteur du manifeste introuvable. & exit /b 1 )',
+            'for /f "usebackq delims=" %%V in (`powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PULID_MANIFEST_READER%" -ManifestPath "%PULID_MANIFEST%" -Component pulid`) do set "PULID_ACTIVE_VERSION=%%V"',
+            'if not defined PULID_ACTIVE_VERSION (',
+            '  echo [ERREUR] Aucune version PuLID locale geree active.',
+            '  exit /b 1',
+            ')',
             'if /i "%~1"=="--self-test" (',
             '  echo Version active : %PULID_ACTIVE_VERSION%',
             '  echo Racine : %~dp0',
@@ -808,6 +980,7 @@ function Write-PuLIDLaunchers([string]$SuiteRoot, $Local) {
             '  echo [ERREUR] Installation PuLID incomplete dans %~dp0',
             '  exit /b 1',
             ')',
+            $(if ($launcher.Mode -eq "local") { 'for %%A in (%*) do if /i "%%~A"=="--network" ( echo [ERREUR] Utilisez Lancer PuLID reseau.bat pour le mode reseau. & exit /b 1 )' } else { 'echo [AVERTISSEMENT] Le port 12693 doit rester limite a un reseau de confiance.' }),
             ('call "%PULID_START%" ' + $launcher.NetworkArgument + '%*'),
             'exit /b %ERRORLEVEL%',
             ''
@@ -921,17 +1094,29 @@ function Invoke-SelfTest {
                 roleplayBackgrounds = [pscustomobject]@{ activeContentVersion = "1.0.0"; activeFormatVersion = "1.0.0" }
             }
         }
+        $launcherStateDirectory = Join-Path $selfTestRoot "state"
+        $launcherManifestPath = Join-Path $launcherStateDirectory "installation.json"
+        $script:StateDirectory = $launcherStateDirectory
+        $script:LocalManifestPath = $launcherManifestPath
+        Write-LocalManifestAtomic $launcherLocal
         Write-UserLauncher $selfTestRoot $launcherLocal
+        Write-UpdaterLauncher $selfTestRoot $launcherLocal
         Write-PuLIDLaunchers $selfTestRoot $launcherLocal
         $launcherPath = Join-Path $selfTestRoot $script:UserLauncherName
         $launcherContents = [IO.File]::ReadAllText($launcherPath)
         if (-not $launcherContents.Contains('set "RP_BOT_DATA_DIR=%~dp0data\rp-bot"') -or
-            -not $launcherContents.Contains('set "RP_BOT_ROLEPLAY_BACKGROUNDS_DIR=%~dp0assets\roleplay-backgrounds\1.0.0-format-1.0.0"')) {
+            -not $launcherContents.Contains('runtimes\rp-bot-suite\suite-launcher.mjs') -or
+            -not $launcherContents.Contains('--suite-root "%~dp0."')) {
             Fail "Self-test chemins relatifs du lanceur Windows en échec."
         }
         $launcherOutput = @(& $launcherPath --self-test 2>&1) -join "`n"
         if ($LASTEXITCODE -ne 0 -or $launcherOutput -notlike "*Version active : 0.2.0-beta.1*" -or $launcherOutput -notlike "*Donnees : $selfTestRoot\data\rp-bot*") {
-            Fail "Self-test exécution du lanceur Windows en échec."
+            Fail ("Self-test exécution du lanceur Windows en échec.`r`n" + $launcherOutput)
+        }
+        $updaterLauncher = Join-Path $selfTestRoot $script:UpdaterLauncherName
+        $updaterOutput = @(& $updaterLauncher --self-test 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $updaterOutput -notlike "*Version active : 0.2.0-beta.1*" -or $updaterOutput -notlike "*Demande : $selfTestRoot\state\update-request.json*") {
+            Fail ("Self-test lanceur updater Windows en échec.`r`n" + $updaterOutput)
         }
         $pulidLocalLauncher = Join-Path $selfTestRoot $script:PuLIDLocalLauncherName
         $pulidNetworkLauncher = Join-Path $selfTestRoot $script:PuLIDNetworkLauncherName
@@ -946,21 +1131,26 @@ function Invoke-SelfTest {
         $pulidNetworkOutput = @(& $pulidNetworkLauncher --self-test 2>&1) -join "`n"
         $pulidNetworkExitCode = $LASTEXITCODE
         if ($pulidLocalExitCode -ne 0 -or $pulidLocalOutput -notlike "*Version active : 0.1.0*" -or $pulidLocalOutput -notlike "*Mode : local*") {
-            Fail "Self-test lanceur PuLID local en échec."
+            Fail ("Self-test lanceur PuLID local en échec.`r`n" + $pulidLocalOutput)
         }
         if ($pulidNetworkExitCode -ne 0 -or $pulidNetworkOutput -notlike "*Version active : 0.1.0*" -or $pulidNetworkOutput -notlike "*Mode : reseau*") {
-            Fail "Self-test lanceur PuLID réseau en échec."
+            Fail ("Self-test lanceur PuLID réseau en échec.`r`n" + $pulidNetworkOutput)
         }
         Copy-Item -LiteralPath $selfTestRoot -Destination $movedRoot -Recurse
         $movedLauncher = Join-Path $movedRoot $script:UserLauncherName
         $movedOutput = @(& $movedLauncher --self-test 2>&1) -join "`n"
         if ($LASTEXITCODE -ne 0 -or $movedOutput -notlike "*Donnees : $movedRoot\data\rp-bot*") {
-            Fail "Self-test déplacement de la suite Windows en échec."
+            Fail ("Self-test déplacement de la suite Windows en échec.`r`n" + $movedOutput)
         }
         $movedPulidNetworkLauncher = Join-Path $movedRoot $script:PuLIDNetworkLauncherName
         $movedPulidNetworkOutput = @(& $movedPulidNetworkLauncher --self-test 2>&1) -join "`n"
         if ($LASTEXITCODE -ne 0 -or $movedPulidNetworkOutput -notlike "*Racine : $movedRoot\*") {
-            Fail "Self-test déplacement du lanceur PuLID réseau en échec."
+            Fail ("Self-test déplacement du lanceur PuLID réseau en échec.`r`n" + $movedPulidNetworkOutput)
+        }
+        $movedUpdaterLauncher = Join-Path $movedRoot $script:UpdaterLauncherName
+        $movedUpdaterOutput = @(& $movedUpdaterLauncher --self-test 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $movedUpdaterOutput -notlike "*Racine : $movedRoot\*" -or $movedUpdaterOutput -notlike "*Demande : $movedRoot\state\update-request.json*") {
+            Fail ("Self-test déplacement du lanceur updater Windows en échec.`r`n" + $movedUpdaterOutput)
         }
     } finally {
         $script:StateDirectory = $previousStateDirectory
@@ -975,8 +1165,7 @@ function Main {
     if (-not [IO.Path]::IsPathRooted($Root)) { Fail "-Root doit être un chemin absolu." }
     $script:TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("rp-bot-installer." + [Guid]::NewGuid())
     New-Item -ItemType Directory -Path $script:TemporaryRoot -Force | Out-Null
-    New-Item -ItemType Directory -Path $script:StateDirectory -Force | Out-Null
-    New-Item -ItemType Directory -Path $script:DownloadDirectory -Force | Out-Null
+    Initialize-PermanentDirectories
     Write-Host "Dossier de suite : $Root"
 
     Write-Section "Lecture du canal $Channel"
@@ -1041,7 +1230,10 @@ function Main {
     if ($installPulid) { Install-PuLID $manifest $currentPulid }
     if ($installBackgrounds) { Install-Backgrounds $manifest }
     $installedLocal = Read-LocalManifest
-    if ($null -ne $installedLocal.components.rpBot) { Write-UserLauncher $Root $installedLocal }
+    if ($null -ne $installedLocal.components.rpBot) {
+        Write-UserLauncher $Root $installedLocal
+        Write-UpdaterLauncher $Root $installedLocal
+    }
     if ($null -ne $installedLocal.components.pulid) { Write-PuLIDLaunchers $Root $installedLocal }
     Write-Section "Installation terminée"
     Write-Host "Manifeste local : $($script:LocalManifestPath)"
