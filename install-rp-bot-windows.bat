@@ -85,7 +85,7 @@ function Initialize-PermanentDirectories {
 
 function Install-SuiteRuntime([string]$ReleaseRoot) {
     New-Item -ItemType Directory -Path $script:SuiteRuntimeDirectory -Force | Out-Null
-    foreach ($fileName in @("suite-launcher.mjs", "suite-updater.mjs", "safe-extract-windows.ps1")) {
+    foreach ($fileName in @("suite-launcher.mjs", "suite-updater.mjs", "update-request-contract.mjs", "safe-extract-windows.ps1")) {
         $sourcePath = Join-Path $ReleaseRoot ("suite-runtime\" + $fileName)
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { Fail "L'artefact RP Bot ne contient pas $fileName." }
         $destinationPath = Join-Path $script:SuiteRuntimeDirectory $fileName
@@ -838,7 +838,7 @@ function Install-RpBot($Manifest, [string]$CurrentVersion) {
     Set-InterruptedOperation $kind "rp-bot" "installing" $CurrentVersion $version "Artefact RP Bot vérifié ; extraction en cours."
     $staging = Join-Path $Root ("apps\rp-bot\.staging." + [Guid]::NewGuid()); Expand-SafeArchive $archive $staging
     $prepared = Get-SingleArchiveRoot $staging
-    foreach ($required in @("runtime\node.exe", "launcher.mjs", "suite-runtime\suite-launcher.mjs", "suite-runtime\suite-updater.mjs", "suite-runtime\safe-extract-windows.ps1", "metadata\build.json")) { if (-not (Test-Path -LiteralPath (Join-Path $prepared $required) -PathType Leaf)) { Fail "Artefact RP Bot incomplet : $required" } }
+    foreach ($required in @("runtime\node.exe", "launcher.mjs", "suite-runtime\suite-launcher.mjs", "suite-runtime\suite-updater.mjs", "suite-runtime\update-request-contract.mjs", "suite-runtime\safe-extract-windows.ps1", "metadata\build.json")) { if (-not (Test-Path -LiteralPath (Join-Path $prepared $required) -PathType Leaf)) { Fail "Artefact RP Bot incomplet : $required" } }
     $buildVersion = Read-RpBotBuildVersion (Join-Path $prepared "metadata\build.json")
     if ($buildVersion -ne $version) { Fail "Version interne de l'artefact RP Bot invalide : $buildVersion, attendu $version." }
     $target = Join-Path $Root "apps\rp-bot\$version"; Start-DirectorySwap $prepared $target $staging

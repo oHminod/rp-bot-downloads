@@ -366,7 +366,7 @@ install_suite_runtime() {
   local destination_directory="${SUITE_ROOT}/runtimes/rp-bot-suite"
   local file_name source_path destination_path temporary
   /bin/mkdir -p "${destination_directory}"
-  for file_name in suite-launcher.mjs suite-updater.mjs safe-extract-windows.ps1; do
+  for file_name in suite-launcher.mjs suite-updater.mjs update-request-contract.mjs safe-extract-windows.ps1; do
     source_path="${release_root}/suite-runtime/${file_name}"
     destination_path="${destination_directory}/${file_name}"
     [[ -f "${source_path}" ]] || die "L'artefact RP Bot ne contient pas ${file_name}."
@@ -1178,7 +1178,7 @@ install_rp_bot() {
   extract_archive "${archive}" "${staging}" rp-bot
   single_archive_root "${staging}"; prepared="${REPLY}"
   [[ -x "${prepared}/runtime/node" && -f "${prepared}/launcher.mjs" && -f "${prepared}/metadata/build.json" ]] || die "Artefact RP Bot incomplet."
-  [[ -f "${prepared}/suite-runtime/suite-launcher.mjs" && -f "${prepared}/suite-runtime/suite-updater.mjs" && -f "${prepared}/suite-runtime/safe-extract-windows.ps1" ]] || die "Artefact RP Bot incomplet : runtime externe de suite absent."
+  [[ -f "${prepared}/suite-runtime/suite-launcher.mjs" && -f "${prepared}/suite-runtime/suite-updater.mjs" && -f "${prepared}/suite-runtime/update-request-contract.mjs" && -f "${prepared}/suite-runtime/safe-extract-windows.ps1" ]] || die "Artefact RP Bot incomplet : runtime externe de suite absent."
   actual="$(json_helper build-version "${prepared}/metadata/build.json")"
   [[ "${actual}" == "${version}" ]] || die "L'artefact RP Bot contient la version ${actual}, ${version} attendue."
   target="${SUITE_ROOT}/apps/rp-bot/${version}"
