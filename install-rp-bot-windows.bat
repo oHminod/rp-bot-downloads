@@ -1,8 +1,9 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 set "_rpbot_self=%~f0"
+set "_rpbot_installer_dir=%~dp0"
 set "_rpbot_ps1=%TEMP%\rp-bot-installer-%RANDOM%-%RANDOM%.ps1"
-powershell.exe -NoLogo -NoProfile -Command "$content=[IO.File]::ReadAllText($env:_rpbot_self);$marker='# RP_BOT_POWERSHELL_PAYLOAD';$index=$content.LastIndexOf($marker,[StringComparison]::Ordinal);if($index -lt 0){exit 2};[IO.File]::WriteAllText($env:_rpbot_ps1,$content.Substring($index),(New-Object Text.UTF8Encoding($false)))"
+powershell.exe -NoLogo -NoProfile -Command "$content=[IO.File]::ReadAllText($env:_rpbot_self);$marker='# RP_BOT_POWERSHELL_PAYLOAD';$index=$content.LastIndexOf($marker,[StringComparison]::Ordinal);if($index -lt 0){exit 2};[IO.File]::WriteAllText($env:_rpbot_ps1,$content.Substring($index),(New-Object Text.UTF8Encoding($true)))"
 if errorlevel 1 exit /b %ERRORLEVEL%
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%_rpbot_ps1%" %*
 set "_rpbot_exit=%ERRORLEVEL%"
@@ -17,7 +18,12 @@ param(
     [string]$Channel = "beta",
     [ValidateSet("rp-bot", "pulid", "both")]
     [string]$Select,
-    [string]$Root = (Join-Path $env:LOCALAPPDATA "RP Bot Suite"),
+    [string]$Root = $(
+        if ([string]::IsNullOrWhiteSpace($env:_rpbot_installer_dir)) {
+            Join-Path $PSScriptRoot "RP Bot Suite"
+        }
+        else { Join-Path $env:_rpbot_installer_dir "RP Bot Suite" }
+    ),
     [string]$ModelsRoot,
     [ValidateSet("yes", "no", "ask")]
     [string]$Backgrounds = "ask",
@@ -36,6 +42,9 @@ $ErrorActionPreference = "Stop"
 
 $script:PublicRepository = "oHminod/rp-bot-downloads"
 $script:PublicRawBase = "https://raw.githubusercontent.com/$($script:PublicRepository)/main"
+$script:UserLauncherName = "Lancer RP Bot.bat"
+$script:PuLIDLocalLauncherName = "Lancer PuLID local.bat"
+$script:PuLIDNetworkLauncherName = "Lancer PuLID reseau.bat"
 $script:StateDirectory = Join-Path $Root "state"
 $script:DownloadDirectory = Join-Path $script:StateDirectory "downloads"
 $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
@@ -141,6 +150,22 @@ function Read-JsonStrict([string]$Path, [string]$Label) {
     catch { Fail "$Label n'est pas un JSON valide : $($_.Exception.Message)" }
 }
 
+function Read-RpBotBuildVersion([string]$Path) {
+    $parsed = @(Read-JsonStrict $Path "Métadonnées RP Bot")
+    if (@($parsed).Count -ne 1) { Fail "Métadonnées RP Bot ambiguës : un objet JSON unique est requis." }
+    $build = $parsed[0]
+    Assert-ExactProperties $build @("schemaVersion", "application", "version", "buildId", "builtAt", "target", "nodeRuntimeVersion", "signed") "Métadonnées RP Bot"
+    if ($build.schemaVersion -ne 1 -or $build.application -ne "rp-bot") { Fail "Métadonnées RP Bot non prises en charge." }
+    Assert-SemVer $build.version "Métadonnées RP Bot.version"
+    Assert-SemVer $build.nodeRuntimeVersion "Métadonnées RP Bot.nodeRuntimeVersion"
+    Assert-Text $build.buildId "Métadonnées RP Bot.buildId"
+    Assert-Text $build.builtAt "Métadonnées RP Bot.builtAt"
+    Assert-ExactProperties $build.target @("platform", "arch") "Métadonnées RP Bot.target"
+    if ($build.target.platform -ne "windows" -or $build.target.arch -ne "x64") { Fail "Cible interne de l'artefact RP Bot invalide." }
+    if ($build.signed -isnot [bool]) { Fail "Métadonnées RP Bot.signed doit être un booléen." }
+    return [string]$build.version
+}
+
 function Read-ChannelPointer([string]$Path) {
     $pointer = Read-JsonStrict $Path "Pointeur de canal"
     Assert-ExactProperties $pointer @("schemaVersion", "channel", "updatedAt", "suiteVersion", "manifest", "channelSignature") "Pointeur"
@@ -204,31 +229,31 @@ function Read-SuiteManifest([string]$Path) {
     foreach ($key in $expectedArtifacts.Keys) {
         $parts = $key.Split(":")
         $found = @($manifest.artifacts | Where-Object { $_.component -eq $parts[0] -and $_.platform -eq $parts[1] -and $_.architecture -eq $parts[2] })
-        if ($found.Count -ne 1 -or $found[0].fileName -ne $expectedArtifacts[$key]) { Fail "Artefact obligatoire absent ou mal nommé : $key." }
+        if (@($found).Count -ne 1 -or $found[0].fileName -ne $expectedArtifacts[$key]) { Fail "Artefact obligatoire absent ou mal nommé : $key." }
     }
     if (@($manifest.installationRequirements).Count -ne 8) { Fail "Les huit lignes de prérequis MVP sont obligatoires." }
     foreach ($selectionName in @("rp-bot", "pulid", "pulid-models", "roleplay-backgrounds")) {
         foreach ($target in @(@("macos", "arm64"), @("windows", "x64"))) {
             $found = @($manifest.installationRequirements | Where-Object { $_.selection -eq $selectionName -and $_.platform -eq $target[0] -and $_.architecture -eq $target[1] })
-            if ($found.Count -ne 1) { Fail "Prérequis absent ou ambigu pour $selectionName/$($target[0])-$($target[1])." }
+            if (@($found).Count -ne 1) { Fail "Prérequis absent ou ambigu pour $selectionName/$($target[0])-$($target[1])." }
         }
     }
     return $manifest
 }
 
 function Get-Artifact($Manifest, [string]$Component) {
-    $found = if ($Component -eq "rp-bot") {
-        @($Manifest.artifacts | Where-Object { $_.component -eq $Component -and $_.platform -eq "windows" -and $_.architecture -eq "x64" })
+    if ($Component -eq "rp-bot") {
+        $found = @($Manifest.artifacts | Where-Object { $_.component -eq $Component -and $_.platform -eq "windows" -and $_.architecture -eq "x64" })
     } else {
-        @($Manifest.artifacts | Where-Object { $_.component -eq $Component -and $_.platform -eq "any" -and $_.architecture -eq "any" })
+        $found = @($Manifest.artifacts | Where-Object { $_.component -eq $Component -and $_.platform -eq "any" -and $_.architecture -eq "any" })
     }
-    if ($found.Count -ne 1) { Fail "Artefact absent ou ambigu pour $Component." }
+    if (@($found).Count -ne 1) { Fail "Artefact absent ou ambigu pour $Component." }
     return $found[0]
 }
 
 function Get-Requirement($Manifest, [string]$SelectionName) {
     $found = @($Manifest.installationRequirements | Where-Object { $_.selection -eq $SelectionName -and $_.platform -eq "windows" -and $_.architecture -eq "x64" })
-    if ($found.Count -ne 1) { Fail "Prérequis absent ou ambigu pour $SelectionName." }
+    if (@($found).Count -ne 1) { Fail "Prérequis absent ou ambigu pour $SelectionName." }
     return $found[0]
 }
 
@@ -331,7 +356,7 @@ function Expand-SafeArchive([string]$Archive, [string]$Destination) {
 
 function Get-SingleArchiveRoot([string]$Staging) {
     $entries = @(Get-ChildItem -LiteralPath $Staging -Force)
-    if ($entries.Count -ne 1 -or -not $entries[0].PSIsContainer) { Fail "L'archive doit contenir exactement un dossier racine." }
+    if (@($entries).Count -ne 1 -or -not $entries[0].PSIsContainer) { Fail "L'archive doit contenir exactement un dossier racine." }
     return $entries[0].FullName
 }
 
@@ -421,17 +446,14 @@ function Read-LocalManifest {
 function Write-LocalManifestAtomic($Local) {
     New-Item -ItemType Directory -Path $script:StateDirectory -Force | Out-Null
     $temporary = Join-Path $script:StateDirectory (".installation.json.{0}.tmp" -f [Guid]::NewGuid())
+    $backup = Join-Path $script:StateDirectory (".installation.json.{0}.bak" -f [Guid]::NewGuid())
     $json = $Local | ConvertTo-Json -Depth 30
     [IO.File]::WriteAllText($temporary, $json + "`r`n", (New-Object Text.UTF8Encoding($false)))
-    if (Test-Path -LiteralPath $script:LocalManifestPath) { [IO.File]::Replace($temporary, $script:LocalManifestPath, $null, $true) }
+    if (Test-Path -LiteralPath $script:LocalManifestPath) {
+        [IO.File]::Replace($temporary, $script:LocalManifestPath, $backup, $true)
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    }
     else { [IO.File]::Move($temporary, $script:LocalManifestPath) }
-}
-
-function Upsert-Release($Releases, $Next, [string[]]$Keys) {
-    $kept = @($Releases | Where-Object {
-        $item = $_; @($Keys | Where-Object { $item.$_ -ne $Next.$_ }).Count -gt 0
-    })
-    return @($kept + $Next)
 }
 
 function Set-InterruptedOperation([string]$Kind, [string]$Component, [string]$Stage, [string]$FromVersion, [string]$ToVersion, [string]$Checkpoint) {
@@ -451,7 +473,12 @@ function Activate-RpBot([string]$Version, [string]$ReleasePath) {
     $local = Read-LocalManifest; $old = $local.components.rpBot; $now = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
     $releases = if ($null -eq $old) { @() } else { @($old.releases) }
     $next = [pscustomobject]@{ version = $Version; releasePath = $ReleasePath; installedAt = $now }
-    $local.components.rpBot = [pscustomobject]@{ id = "rp-bot"; installedVersion = $Version; activeVersion = $Version; releases = @(Upsert-Release $releases $next @("version")) }
+    $updatedReleases = New-Object Collections.Generic.List[object]
+    foreach ($release in @($releases)) {
+        if ([string]$release.version -ne $Version) { $updatedReleases.Add($release) | Out-Null }
+    }
+    $updatedReleases.Add($next) | Out-Null
+    $local.components.rpBot = [pscustomobject]@{ id = "rp-bot"; installedVersion = $Version; activeVersion = $Version; releases = @($updatedReleases.ToArray()) }
     $local.updateChannel = $Channel; Write-LocalManifestAtomic $local
 }
 
@@ -459,7 +486,12 @@ function Activate-PuLID([string]$Version, [string]$ReleasePath, [string]$ModelPa
     $local = Read-LocalManifest; $old = $local.components.pulid; $now = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
     $releases = if ($null -eq $old -or $null -eq $old.managedInstallation) { @() } else { @($old.managedInstallation.releases) }
     $next = [pscustomobject]@{ version = $Version; releasePath = $ReleasePath; installedAt = $now }
-    $managed = [pscustomobject]@{ id = "pulid"; installedVersion = $Version; activeVersion = $Version; releases = @(Upsert-Release $releases $next @("version")) }
+    $updatedReleases = New-Object Collections.Generic.List[object]
+    foreach ($release in @($releases)) {
+        if ([string]$release.version -ne $Version) { $updatedReleases.Add($release) | Out-Null }
+    }
+    $updatedReleases.Add($next) | Out-Null
+    $managed = [pscustomobject]@{ id = "pulid"; installedVersion = $Version; activeVersion = $Version; releases = @($updatedReleases.ToArray()) }
     $local.components.pulid = [pscustomobject]@{ id = "pulid"; installationType = "managed-local"; detectedVersion = $Version; endpoint = "http://127.0.0.1:12693"; modelsPath = $ModelPath; managedInstallation = $managed }
     $local.updateChannel = $Channel; Write-LocalManifestAtomic $local
 }
@@ -468,8 +500,12 @@ function Activate-Backgrounds([string]$ContentVersion, [string]$FormatVersion, [
     $local = Read-LocalManifest; $old = $local.components.roleplayBackgrounds; $now = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")
     $releases = if ($null -eq $old) { @() } else { @($old.releases) }
     $next = [pscustomobject]@{ contentVersion = $ContentVersion; formatVersion = $FormatVersion; releasePath = $ReleasePath; installedAt = $now }
-    $all = @(Upsert-Release $releases $next @("contentVersion", "formatVersion"))
-    $local.components.roleplayBackgrounds = [pscustomobject]@{ id = "roleplay-backgrounds"; installedContentVersion = $ContentVersion; installedFormatVersion = $FormatVersion; activeContentVersion = $ContentVersion; activeFormatVersion = $FormatVersion; activePath = $ReleasePath; releases = $all }
+    $updatedReleases = New-Object Collections.Generic.List[object]
+    foreach ($release in @($releases)) {
+        if ([string]$release.contentVersion -ne $ContentVersion -or [string]$release.formatVersion -ne $FormatVersion) { $updatedReleases.Add($release) | Out-Null }
+    }
+    $updatedReleases.Add($next) | Out-Null
+    $local.components.roleplayBackgrounds = [pscustomobject]@{ id = "roleplay-backgrounds"; installedContentVersion = $ContentVersion; installedFormatVersion = $FormatVersion; activeContentVersion = $ContentVersion; activeFormatVersion = $FormatVersion; activePath = $ReleasePath; releases = @($updatedReleases.ToArray()) }
     $local.updateChannel = $Channel; Write-LocalManifestAtomic $local
 }
 
@@ -511,6 +547,32 @@ function Require-Connectivity([string]$Label, [string]$Url) {
     catch { Fail "Connexion impossible vers $Label ($Url). Vérifiez le réseau, le proxy ou le pare-feu." }
 }
 
+function Get-NvidiaCudaMajorFromText([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $match = [regex]::Match($Text, '(?im)\bCUDA(?:\s+UMD)?\s+Version\s*:\s*(?<major>\d+)(?:\.\d+)?\b')
+    if (-not $match.Success) { return $null }
+    return [int]$match.Groups["major"].Value
+}
+
+function Get-NvidiaCudaMajorFromXml([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    try { $document = [xml]$Text }
+    catch { return $null }
+    $nodes = @($document.SelectNodes("//*[local-name()='cuda_version' or local-name()='cuda_umd_version']"))
+    foreach ($node in $nodes) {
+        $major = Get-NvidiaCudaMajorFromText ("CUDA Version: " + [string]$node.InnerText)
+        if ($null -ne $major) { return $major }
+    }
+    return $null
+}
+
+function Format-NvidiaSmiDiagnostic([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "<sortie vide>" }
+    $summary = [regex]::Replace($Text, '\s+', ' ').Trim()
+    if ($summary.Length -gt 500) { return $summary.Substring(0, 500) + "…" }
+    return $summary
+}
+
 function Run-Preflight($Manifest, [bool]$InstallRp, [bool]$InstallPulid, [bool]$InstallBackgrounds) {
     if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -notin @("AMD64", "x86")) { Fail "Le MVP Windows exige Windows 11 x64." }
     if ([Environment]::OSVersion.Version.Build -lt 22000) { Fail "Windows 11 ou plus récent est requis." }
@@ -521,13 +583,30 @@ function Run-Preflight($Manifest, [bool]$InstallRp, [bool]$InstallPulid, [bool]$
         $runtime = Get-Requirement $Manifest "pulid"; $models = Get-Requirement $Manifest "pulid-models"
         $appDisk += [int64]$runtime.requiredFreeDiskBytes; $modelDisk += [int64]$models.requiredFreeDiskBytes; $memory = [Math]::Max($memory, [int64]$runtime.requiredMemoryBytes); Require-Port 12693 "PuLID"
         $gpus = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match "NVIDIA" })
-        if ($gpus.Count -eq 0) { Fail "PuLID sous Windows exige un GPU NVIDIA." }
+        if (@($gpus).Count -eq 0) { Fail "PuLID sous Windows exige un GPU NVIDIA." }
         $cudaRequired = [int]$runtime.gpuRequirement.cudaMajorVersion
-        $smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
-        if (-not $smi) { Fail "nvidia-smi est introuvable. Installez un pilote NVIDIA compatible CUDA $cudaRequired." }
-        $smiText = (& $smi.Source 2>&1 | Out-String)
-        if ($smiText -notmatch 'CUDA Version:\s*(\d+)') { Fail "La version CUDA maximale du pilote NVIDIA n'a pas pu être détectée." }
-        if ([int]$Matches[1] -lt $cudaRequired) { Fail "Le pilote NVIDIA annonce CUDA $($Matches[1]), CUDA $cudaRequired minimum est requis." }
+        $smiCommands = @(Get-Command nvidia-smi.exe -CommandType Application -ErrorAction SilentlyContinue)
+        if (@($smiCommands).Count -eq 0) { Fail "nvidia-smi est introuvable. Installez un pilote NVIDIA compatible CUDA $cudaRequired." }
+        $smiPath = [string]$smiCommands[0].Path
+        if ([string]::IsNullOrWhiteSpace($smiPath)) { Fail "Le chemin de nvidia-smi est introuvable. Réinstallez le pilote NVIDIA." }
+        $xmlLines = @(& $smiPath "--query" "--xml-format" 2>&1)
+        $xmlExitCode = $LASTEXITCODE
+        $xmlText = @($xmlLines | ForEach-Object { [string]$_ }) -join "`n"
+        $cudaMajor = if ($xmlExitCode -eq 0) { Get-NvidiaCudaMajorFromXml $xmlText } else { $null }
+        $bannerText = ""
+        $bannerExitCode = $null
+        if ($null -eq $cudaMajor) {
+            $bannerLines = @(& $smiPath 2>&1)
+            $bannerExitCode = $LASTEXITCODE
+            $bannerText = @($bannerLines | ForEach-Object { [string]$_ }) -join "`n"
+            if ($bannerExitCode -eq 0) { $cudaMajor = Get-NvidiaCudaMajorFromText $bannerText }
+        }
+        if ($null -eq $cudaMajor) {
+            $diagnosticText = if (-not [string]::IsNullOrWhiteSpace($bannerText)) { $bannerText } else { $xmlText }
+            $exitDetails = "XML=$xmlExitCode" + $(if ($null -ne $bannerExitCode) { ", bannière=$bannerExitCode" } else { "" })
+            Fail "La version CUDA maximale du pilote NVIDIA n'a pas pu être détectée ($exitDetails). Sortie nvidia-smi : $(Format-NvidiaSmiDiagnostic $diagnosticText)"
+        }
+        if ($cudaMajor -lt $cudaRequired) { Fail "Le pilote NVIDIA annonce CUDA $cudaMajor, CUDA $cudaRequired minimum est requis." }
     }
     if ($InstallBackgrounds) { $appDisk += [int64](Get-Requirement $Manifest "roleplay-backgrounds").requiredFreeDiskBytes }
     Require-Disk $Root $appDisk "les applications et décors sélectionnés"
@@ -537,10 +616,10 @@ function Run-Preflight($Manifest, [bool]$InstallRp, [bool]$InstallPulid, [bool]$
     Require-Connectivity "GitHub" "https://github.com/"
     if ($InstallPulid) {
         Require-Connectivity "Hugging Face" "https://huggingface.co/"
-        Require-Connectivity "PyTorch" "https://download.pytorch.org/"
-        Require-Connectivity "Astral/uv" "https://astral.sh/uv/"
-        Require-Connectivity "llama-cpp-python" "https://abetlen.github.io/llama-cpp-python/"
-        Require-Connectivity "PyPI" "https://pypi.org/simple/"
+        Require-Connectivity "PyTorch CUDA 13" "https://download.pytorch.org/whl/cu130"
+        Require-Connectivity "Astral/uv" "https://astral.sh/uv/install.ps1"
+        Require-Connectivity "llama-cpp-python CUDA 13" "https://abetlen.github.io/llama-cpp-python/whl/cu130"
+        Require-Connectivity "PyPI" "https://pypi.org/simple"
     }
     $selected = @()
     if ($InstallRp) { $selected += "rp-bot" }
@@ -563,8 +642,8 @@ function Install-RpBot($Manifest, [string]$CurrentVersion) {
     $staging = Join-Path $Root ("apps\rp-bot\.staging." + [Guid]::NewGuid()); Expand-SafeArchive $archive $staging
     $prepared = Get-SingleArchiveRoot $staging
     foreach ($required in @("runtime\node.exe", "launcher.mjs", "metadata\build.json")) { if (-not (Test-Path -LiteralPath (Join-Path $prepared $required) -PathType Leaf)) { Fail "Artefact RP Bot incomplet : $required" } }
-    $metadata = Read-JsonStrict (Join-Path $prepared "metadata\build.json") "Métadonnées RP Bot"
-    if ($metadata.application -ne "rp-bot" -or $metadata.version -ne $version) { Fail "Version interne de l'artefact RP Bot invalide." }
+    $buildVersion = Read-RpBotBuildVersion (Join-Path $prepared "metadata\build.json")
+    if ($buildVersion -ne $version) { Fail "Version interne de l'artefact RP Bot invalide : $buildVersion, attendu $version." }
     $target = Join-Path $Root "apps\rp-bot\$version"; Start-DirectorySwap $prepared $target $staging
     Activate-RpBot $version $target; Complete-DirectorySwap; Clear-InterruptedOperation
     Write-Host "RP Bot $version installé et activé sans modifier les données utilisateur."
@@ -577,7 +656,7 @@ function Install-PuLID($Manifest, [string]$CurrentVersion) {
     Set-InterruptedOperation $kind "pulid" "installing" $CurrentVersion $version "Archive PuLID vérifiée ; installation du runtime privé en cours."
     $staging = Join-Path $Root ("apps\pulid\.staging." + [Guid]::NewGuid()); Expand-SafeArchive $archive $staging
     $prepared = Get-SingleArchiveRoot $staging
-    foreach ($required in @("pyproject.toml", "install_production_windows.bat", "install_windows.bat")) { if (-not (Test-Path -LiteralPath (Join-Path $prepared $required) -PathType Leaf)) { Fail "Archive PuLID incomplète : $required" } }
+    foreach ($required in @("pyproject.toml", "install_production_windows.bat", "install_windows.bat", "start_windows.bat")) { if (-not (Test-Path -LiteralPath (Join-Path $prepared $required) -PathType Leaf)) { Fail "Archive PuLID incomplète : $required" } }
     $target = Join-Path $Root "apps\pulid\$version"; Start-DirectorySwap $prepared $target $staging
     $previousModels = $env:PULID_MODELS_ROOT
     try {
@@ -625,11 +704,269 @@ function Install-Backgrounds($Manifest) {
     Write-Host "Pack de décors $($versions.contentVersion) (format $($versions.formatVersion)) vérifié et activé."
 }
 
+function Write-UserLauncher([string]$SuiteRoot, $Local) {
+    if ($null -eq $Local.components.rpBot) { return }
+    $version = [string]$Local.components.rpBot.activeVersion
+    Assert-SemVer $version "Lanceur RP Bot.version"
+    $backgroundsSuffix = $null
+    if ($null -ne $Local.components.roleplayBackgrounds) {
+        $content = [string]$Local.components.roleplayBackgrounds.activeContentVersion
+        $format = [string]$Local.components.roleplayBackgrounds.activeFormatVersion
+        Assert-SemVer $content "Lanceur RP Bot.backgrounds.contentVersion"
+        Assert-SemVer $format "Lanceur RP Bot.backgrounds.formatVersion"
+        $backgroundsSuffix = "assets\roleplay-backgrounds\$content-format-$format"
+    }
+    New-Item -ItemType Directory -Path $SuiteRoot -Force | Out-Null
+    $launcherPath = Join-Path $SuiteRoot $script:UserLauncherName
+    if (Test-Path -LiteralPath $launcherPath) {
+        $existing = [IO.File]::ReadAllText($launcherPath)
+        if (-not $existing.Contains("rem RP_BOT_MANAGED_LAUNCHER")) {
+            Write-Warning "$launcherPath existe déjà et n'a pas été créé par RP Bot ; il est conservé."
+            return
+        }
+    }
+    $backgroundsLine = if ($backgroundsSuffix) {
+        'set "RP_BOT_ROLEPLAY_BACKGROUNDS_DIR=%~dp0' + $backgroundsSuffix + '"'
+    }
+    else { 'set "RP_BOT_ROLEPLAY_BACKGROUNDS_DIR="' }
+    $lines = @(
+        '@echo off',
+        'rem RP_BOT_MANAGED_LAUNCHER',
+        'setlocal EnableExtensions DisableDelayedExpansion',
+        'set "RP_BOT_DATA_DIR=%~dp0data\rp-bot"',
+        $backgroundsLine,
+        ('set "RP_BOT_ACTIVE_VERSION=' + $version + '"'),
+        'if /i "%~1"=="--self-test" (',
+        '  echo Version active : %RP_BOT_ACTIVE_VERSION%',
+        '  echo Racine : %~dp0',
+        '  echo Donnees : %RP_BOT_DATA_DIR%',
+        '  echo Decors : %RP_BOT_ROLEPLAY_BACKGROUNDS_DIR%',
+        '  exit /b 0',
+        ')',
+        'if not exist "%RP_BOT_DATA_DIR%" mkdir "%RP_BOT_DATA_DIR%"',
+        'if not exist "%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\runtime\node.exe" (',
+        '  echo [ERREUR] Installation RP Bot incomplete dans %~dp0',
+        '  exit /b 1',
+        ')',
+        'start "" /b powershell.exe -NoLogo -NoProfile -Command "$url=''http://127.0.0.1:8800'';for($attempt=0;$attempt -lt 60;$attempt++){try{$response=Invoke-WebRequest -UseBasicParsing -Uri ($url + ''/api/health'') -TimeoutSec 1;if($response.StatusCode -eq 200){Start-Process $url;exit 0}}catch{};Start-Sleep -Milliseconds 500}" >nul 2>&1',
+        '"%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\runtime\node.exe" "%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\launcher.mjs"',
+        'exit /b %ERRORLEVEL%',
+        ''
+    )
+    $temporary = Join-Path $SuiteRoot (".rp-bot-launcher.{0}.tmp" -f [Guid]::NewGuid())
+    $backup = Join-Path $SuiteRoot (".rp-bot-launcher.{0}.bak" -f [Guid]::NewGuid())
+    try {
+        [IO.File]::WriteAllText($temporary, ($lines -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $launcherPath) {
+            [IO.File]::Replace($temporary, $launcherPath, $backup, $true)
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        }
+        else { [IO.File]::Move($temporary, $launcherPath) }
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "Lanceur créé : $launcherPath"
+    Write-Host "Vous pouvez déplacer le dossier RP Bot Suite complet."
+}
+
+function Write-PuLIDLaunchers([string]$SuiteRoot, $Local) {
+    if ($null -eq $Local.components.pulid -or
+        [string]$Local.components.pulid.installationType -ne "managed-local" -or
+        $null -eq $Local.components.pulid.managedInstallation) { return }
+    $version = [string]$Local.components.pulid.managedInstallation.activeVersion
+    Assert-SemVer $version "Lanceur PuLID.version"
+    New-Item -ItemType Directory -Path $SuiteRoot -Force | Out-Null
+
+    foreach ($launcher in @(
+        [pscustomobject]@{ Name = $script:PuLIDLocalLauncherName; Mode = "local"; NetworkArgument = "" },
+        [pscustomobject]@{ Name = $script:PuLIDNetworkLauncherName; Mode = "reseau"; NetworkArgument = "--network " }
+    )) {
+        $launcherPath = Join-Path $SuiteRoot $launcher.Name
+        if (Test-Path -LiteralPath $launcherPath) {
+            $existing = [IO.File]::ReadAllText($launcherPath)
+            if (-not $existing.Contains("rem RP_BOT_MANAGED_PULID_LAUNCHER")) {
+                Write-Warning "$launcherPath existe déjà et n'a pas été créé par RP Bot ; il est conservé."
+                continue
+            }
+        }
+        $lines = @(
+            '@echo off',
+            'rem RP_BOT_MANAGED_PULID_LAUNCHER',
+            'setlocal EnableExtensions DisableDelayedExpansion',
+            ('set "PULID_ACTIVE_VERSION=' + $version + '"'),
+            ('set "PULID_LAUNCH_MODE=' + $launcher.Mode + '"'),
+            'if /i "%~1"=="--self-test" (',
+            '  echo Version active : %PULID_ACTIVE_VERSION%',
+            '  echo Racine : %~dp0',
+            '  echo Mode : %PULID_LAUNCH_MODE%',
+            '  exit /b 0',
+            ')',
+            'set "PULID_START=%~dp0apps\pulid\%PULID_ACTIVE_VERSION%\start_windows.bat"',
+            'if not exist "%PULID_START%" (',
+            '  echo [ERREUR] Installation PuLID incomplete dans %~dp0',
+            '  exit /b 1',
+            ')',
+            ('call "%PULID_START%" ' + $launcher.NetworkArgument + '%*'),
+            'exit /b %ERRORLEVEL%',
+            ''
+        )
+        $temporary = Join-Path $SuiteRoot (".pulid-launcher.{0}.tmp" -f [Guid]::NewGuid())
+        $backup = Join-Path $SuiteRoot (".pulid-launcher.{0}.bak" -f [Guid]::NewGuid())
+        try {
+            [IO.File]::WriteAllText($temporary, ($lines -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+            if (Test-Path -LiteralPath $launcherPath) {
+                [IO.File]::Replace($temporary, $launcherPath, $backup, $true)
+                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            }
+            else { [IO.File]::Move($temporary, $launcherPath) }
+        }
+        finally {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "Lanceur créé : $launcherPath"
+    }
+    Write-Host "Le lanceur réseau écoute sur le LAN ; limitez le port 12693 au réseau de confiance dans le pare-feu Windows."
+}
+
 function Invoke-SelfTest {
     if (-not (Test-SafeArchiveEntry "folder/file.txt")) { Fail "Self-test archive sûr en échec." }
     if (Test-SafeArchiveEntry "../escape") { Fail "Self-test traversée en échec." }
     if (Test-SafeArchiveEntry "/absolute") { Fail "Self-test chemin absolu en échec." }
     if (Test-SafeArchiveEntry "C:\escape") { Fail "Self-test chemin Windows en échec." }
+    $accented = "Téléchargement vérifié"
+    $expectedAccented = "T" + [char]0x00E9 + "l" + [char]0x00E9 + "chargement v" + [char]0x00E9 + "rifi" + [char]0x00E9
+    if (-not [string]::Equals($accented, $expectedAccented, [StringComparison]::Ordinal)) { Fail "Self-test encodage UTF-8 accentué en échec." }
+    $cudaBannerFixture = "| NVIDIA-SMI 580.65 | Driver Version: 580.65 | CUDA Version: 13.0 |"
+    if ((Get-NvidiaCudaMajorFromText $cudaBannerFixture) -ne 13) { Fail "Self-test bannière nvidia-smi CUDA en échec." }
+    $cudaQueryFixture = "CUDA UMD Version : 13.1"
+    if ((Get-NvidiaCudaMajorFromText $cudaQueryFixture) -ne 13) { Fail "Self-test sortie détaillée nvidia-smi CUDA en échec." }
+    $cudaXmlFixture = '<?xml version="1.0" ?><nvidia_smi_log><cuda_umd_version>13.1</cuda_umd_version></nvidia_smi_log>'
+    if ((Get-NvidiaCudaMajorFromXml $cudaXmlFixture) -ne 13) { Fail "Self-test XML nvidia-smi CUDA en échec." }
+    $cudaUnavailableFixture = '<?xml version="1.0" ?><nvidia_smi_log><cuda_version>N/A</cuda_version></nvidia_smi_log>'
+    if ($null -ne (Get-NvidiaCudaMajorFromXml $cudaUnavailableFixture)) { Fail "Self-test indisponibilité nvidia-smi CUDA en échec." }
+    $singleArtifact = [pscustomobject]@{ component = "rp-bot"; platform = "windows"; architecture = "x64"; fileName = "rp-bot-single.zip" }
+    $singleManifest = [pscustomobject]@{ artifacts = @($singleArtifact) }
+    $selectedArtifact = Get-Artifact $singleManifest "rp-bot"
+    if ($selectedArtifact.fileName -ne $singleArtifact.fileName) { Fail "Self-test artefact unique en échec." }
+    $selfTestBase = Join-Path ([IO.Path]::GetTempPath()) ("rp-bot-installer-launcher-test." + [Guid]::NewGuid())
+    $selfTestRoot = Join-Path $selfTestBase "RP Bot Suite test"
+    $movedRoot = Join-Path $selfTestBase "RP Bot Suite moved"
+    $previousStateDirectory = $script:StateDirectory
+    $previousLocalManifestPath = $script:LocalManifestPath
+    try {
+        $script:StateDirectory = Join-Path $selfTestRoot "state"
+        $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
+        Write-LocalManifestAtomic ([pscustomobject]@{ marker = "first" })
+        Write-LocalManifestAtomic ([pscustomobject]@{ marker = "second" })
+        $written = [IO.File]::ReadAllText($script:LocalManifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        if ($written.marker -ne "second") { Fail "Self-test remplacement atomique du manifeste local en échec." }
+        if (@(Get-ChildItem -LiteralPath $script:StateDirectory -Force | Where-Object { $_.Name -ne "installation.json" }).Count -ne 0) { Fail "Self-test nettoyage du remplacement atomique en échec." }
+        $script:StateDirectory = Join-Path $selfTestRoot "activation-state"
+        $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
+        $activationManifest = [pscustomobject]@{
+            schemaVersion = 1; suiteId = "rp-bot-suite"; updateChannel = "beta"
+            components = [pscustomobject]@{ rpBot = $null; pulid = $null; roleplayBackgrounds = $null }
+            paths = [pscustomobject]@{ rpBotData = (Join-Path $selfTestRoot "data\rp-bot") }
+            lastHealthCheck = $null
+            interruptedOperation = [pscustomobject]@{
+                id = "self-test-operation"; kind = "install"; component = "rp-bot"; stage = "extract"
+                startedAt = "2026-08-29T00:00:00.000Z"; updatedAt = "2026-08-29T00:00:01.000Z"
+                fromVersion = $null; toVersion = "0.2.0-beta.1"; checkpoint = "Self-test"; recoveryActions = @("resume", "cancel")
+            }
+        }
+        Write-LocalManifestAtomic $activationManifest
+        Activate-RpBot "0.2.0-beta.1" "C:\rp-bot-old"
+        Activate-RpBot "0.2.0-beta.1" "C:\rp-bot-new"
+        $activatedLocal = Read-LocalManifest
+        if (@($activatedLocal.components.rpBot.releases).Count -ne 1 -or $activatedLocal.components.rpBot.releases[0].releasePath -ne "C:\rp-bot-new") {
+            Fail "Self-test activation répétée de RP Bot en échec."
+        }
+        Activate-RpBot "0.2.0-beta.2" "C:\rp-bot-next"
+        $activatedLocal = Read-LocalManifest
+        if (@($activatedLocal.components.rpBot.releases).Count -ne 2) { Fail "Self-test ajout d'une release RP Bot en échec." }
+        Activate-PuLID "0.1.0" "C:\pulid-old" "C:\models-old"
+        Activate-PuLID "0.1.0" "C:\pulid-new" "C:\models-new"
+        $activatedLocal = Read-LocalManifest
+        if (@($activatedLocal.components.pulid.managedInstallation.releases).Count -ne 1 -or $activatedLocal.components.pulid.managedInstallation.releases[0].releasePath -ne "C:\pulid-new") {
+            Fail "Self-test activation répétée de PuLID en échec."
+        }
+        Activate-Backgrounds "1.0.0" "1.0.0" "C:\backgrounds-old"
+        Activate-Backgrounds "1.0.0" "1.0.0" "C:\backgrounds-new"
+        $activatedLocal = Read-LocalManifest
+        if (@($activatedLocal.components.roleplayBackgrounds.releases).Count -ne 1 -or $activatedLocal.components.roleplayBackgrounds.releases[0].releasePath -ne "C:\backgrounds-new") {
+            Fail "Self-test activation répétée des décors en échec."
+        }
+        $buildFixturePath = Join-Path $selfTestRoot "build.json"
+        $buildFixture = [pscustomobject]@{
+            schemaVersion = 1; application = "rp-bot"; version = "0.2.0-beta.1"
+            buildId = "self-test-build"; builtAt = "2026-08-29T00:00:00.000Z"
+            target = [pscustomobject]@{ platform = "windows"; arch = "x64" }
+            nodeRuntimeVersion = "24.5.0"; signed = $false
+        }
+        [IO.File]::WriteAllText($buildFixturePath, (($buildFixture | ConvertTo-Json -Depth 5) + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+        $parsedBuildVersion = Read-RpBotBuildVersion $buildFixturePath
+        if ($parsedBuildVersion -ne "0.2.0-beta.1") {
+            Fail "Self-test lecture des métadonnées RP Bot en échec."
+        }
+        $launcherLocal = [pscustomobject]@{
+            components = [pscustomobject]@{
+                rpBot = [pscustomobject]@{ activeVersion = "0.2.0-beta.1" }
+                pulid = [pscustomobject]@{
+                    installationType = "managed-local"
+                    managedInstallation = [pscustomobject]@{ activeVersion = "0.1.0" }
+                }
+                roleplayBackgrounds = [pscustomobject]@{ activeContentVersion = "1.0.0"; activeFormatVersion = "1.0.0" }
+            }
+        }
+        Write-UserLauncher $selfTestRoot $launcherLocal
+        Write-PuLIDLaunchers $selfTestRoot $launcherLocal
+        $launcherPath = Join-Path $selfTestRoot $script:UserLauncherName
+        $launcherContents = [IO.File]::ReadAllText($launcherPath)
+        if (-not $launcherContents.Contains('set "RP_BOT_DATA_DIR=%~dp0data\rp-bot"') -or
+            -not $launcherContents.Contains('set "RP_BOT_ROLEPLAY_BACKGROUNDS_DIR=%~dp0assets\roleplay-backgrounds\1.0.0-format-1.0.0"')) {
+            Fail "Self-test chemins relatifs du lanceur Windows en échec."
+        }
+        $launcherOutput = @(& $launcherPath --self-test 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $launcherOutput -notlike "*Version active : 0.2.0-beta.1*" -or $launcherOutput -notlike "*Donnees : $selfTestRoot\data\rp-bot*") {
+            Fail "Self-test exécution du lanceur Windows en échec."
+        }
+        $pulidLocalLauncher = Join-Path $selfTestRoot $script:PuLIDLocalLauncherName
+        $pulidNetworkLauncher = Join-Path $selfTestRoot $script:PuLIDNetworkLauncherName
+        $pulidLocalContents = [IO.File]::ReadAllText($pulidLocalLauncher)
+        $pulidNetworkContents = [IO.File]::ReadAllText($pulidNetworkLauncher)
+        if (-not $pulidLocalContents.Contains('call "%PULID_START%" %*') -or
+            -not $pulidNetworkContents.Contains('call "%PULID_START%" --network %*')) {
+            Fail "Self-test arguments des lanceurs PuLID en échec."
+        }
+        $pulidLocalOutput = @(& $pulidLocalLauncher --self-test 2>&1) -join "`n"
+        $pulidLocalExitCode = $LASTEXITCODE
+        $pulidNetworkOutput = @(& $pulidNetworkLauncher --self-test 2>&1) -join "`n"
+        $pulidNetworkExitCode = $LASTEXITCODE
+        if ($pulidLocalExitCode -ne 0 -or $pulidLocalOutput -notlike "*Version active : 0.1.0*" -or $pulidLocalOutput -notlike "*Mode : local*") {
+            Fail "Self-test lanceur PuLID local en échec."
+        }
+        if ($pulidNetworkExitCode -ne 0 -or $pulidNetworkOutput -notlike "*Version active : 0.1.0*" -or $pulidNetworkOutput -notlike "*Mode : reseau*") {
+            Fail "Self-test lanceur PuLID réseau en échec."
+        }
+        Copy-Item -LiteralPath $selfTestRoot -Destination $movedRoot -Recurse
+        $movedLauncher = Join-Path $movedRoot $script:UserLauncherName
+        $movedOutput = @(& $movedLauncher --self-test 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $movedOutput -notlike "*Donnees : $movedRoot\data\rp-bot*") {
+            Fail "Self-test déplacement de la suite Windows en échec."
+        }
+        $movedPulidNetworkLauncher = Join-Path $movedRoot $script:PuLIDNetworkLauncherName
+        $movedPulidNetworkOutput = @(& $movedPulidNetworkLauncher --self-test 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $movedPulidNetworkOutput -notlike "*Racine : $movedRoot\*") {
+            Fail "Self-test déplacement du lanceur PuLID réseau en échec."
+        }
+    } finally {
+        $script:StateDirectory = $previousStateDirectory
+        $script:LocalManifestPath = $previousLocalManifestPath
+        if (Test-Path -LiteralPath $selfTestBase) { Remove-Item -LiteralPath $selfTestBase -Recurse -Force -ErrorAction SilentlyContinue }
+    }
     Write-Host "Self-test installateur Windows : OK"
 }
 
@@ -640,6 +977,7 @@ function Main {
     New-Item -ItemType Directory -Path $script:TemporaryRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $script:StateDirectory -Force | Out-Null
     New-Item -ItemType Directory -Path $script:DownloadDirectory -Force | Out-Null
+    Write-Host "Dossier de suite : $Root"
 
     Write-Section "Lecture du canal $Channel"
     $pointerUrl = "$($script:PublicRawBase)/latest-$Channel.json"; $pointerPath = Join-Path $script:TemporaryRoot "latest-$Channel.json"
@@ -702,11 +1040,19 @@ function Main {
     if ($installRp) { Install-RpBot $manifest $currentRp }
     if ($installPulid) { Install-PuLID $manifest $currentPulid }
     if ($installBackgrounds) { Install-Backgrounds $manifest }
+    $installedLocal = Read-LocalManifest
+    if ($null -ne $installedLocal.components.rpBot) { Write-UserLauncher $Root $installedLocal }
+    if ($null -ne $installedLocal.components.pulid) { Write-PuLIDLaunchers $Root $installedLocal }
     Write-Section "Installation terminée"
     Write-Host "Manifeste local : $($script:LocalManifestPath)"
     Write-Host "Les composants non sélectionnés, les données RP Bot et les modèles PuLID n'ont pas été supprimés."
 }
 
 try { Main }
-catch { if ($null -ne $script:Swap) { Undo-DirectorySwap }; Write-Error $_.Exception.Message; exit 1 }
+catch {
+    if ($null -ne $script:Swap) { Undo-DirectorySwap }
+    $location = $_.InvocationInfo.PositionMessage
+    Write-Error ($_.Exception.Message + $(if ($location) { "`r`n$location" } else { "" }))
+    exit 1
+}
 finally { if ($script:TemporaryRoot -and (Test-Path -LiteralPath $script:TemporaryRoot)) { Remove-Item -LiteralPath $script:TemporaryRoot -Recurse -Force -ErrorAction SilentlyContinue } }

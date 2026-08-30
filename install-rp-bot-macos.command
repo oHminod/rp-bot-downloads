@@ -13,7 +13,10 @@ umask 077
 
 readonly PUBLIC_REPOSITORY="oHminod/rp-bot-downloads"
 readonly PUBLIC_RAW_BASE="https://raw.githubusercontent.com/${PUBLIC_REPOSITORY}/main"
-readonly DEFAULT_SUITE_ROOT="${HOME}/Library/Application Support/RP Bot Suite"
+readonly INSTALLER_PATH="${0:A}"
+readonly INSTALLER_DIRECTORY="${INSTALLER_PATH:h}"
+readonly DEFAULT_SUITE_ROOT="${INSTALLER_DIRECTORY}/RP Bot Suite"
+readonly USER_LAUNCHER_NAME="Lancer RP Bot.command"
 readonly PULID_ENDPOINT="http://127.0.0.1:12693"
 readonly RP_BOT_PORT=8800
 readonly PULID_PORT=12693
@@ -40,6 +43,134 @@ notice() {
   print -- "\n==> $*"
 }
 
+write_user_launcher() {
+  local destination_directory="$1"
+  local launcher_path="${destination_directory}/${USER_LAUNCHER_NAME}"
+  local temporary
+  if [[ ! -d "${destination_directory}" || ! -w "${destination_directory}" ]]; then
+    print -u2 -- "[AVERTISSEMENT] Impossible de créer le lanceur dans ${destination_directory}."
+    return 0
+  fi
+  if [[ -e "${launcher_path}" ]] && {
+    [[ ! -f "${launcher_path}" ]] ||
+      ! /usr/bin/grep -q '^# RP_BOT_MANAGED_LAUNCHER$' "${launcher_path}"
+  }; then
+    print -u2 -- "[AVERTISSEMENT] ${launcher_path} existe déjà et n'a pas été créé par RP Bot ; il est conservé."
+    return 0
+  fi
+  if ! temporary="$(/usr/bin/mktemp "${destination_directory}/.rp-bot-launcher.XXXXXX")"; then
+    print -u2 -- "[AVERTISSEMENT] Impossible de préparer le lanceur dans ${destination_directory}."
+    return 0
+  fi
+  if ! {
+    {
+      print -r -- '#!/bin/zsh'
+      print -r -- '# RP_BOT_MANAGED_LAUNCHER'
+      print -r -- ''
+      print -r -- 'emulate -L zsh'
+      print -r -- 'set -eu'
+      print -r -- 'setopt pipefail'
+      cat <<'LAUNCHER'
+readonly SUITE_ROOT="${0:A:h}"
+readonly LOCAL_MANIFEST="${SUITE_ROOT}/state/installation.json"
+readonly APPLICATION_URL="http://127.0.0.1:${PORT:-8800}"
+
+die() {
+  print -u2 -- "[ERREUR] $*"
+  exit 1
+}
+
+[[ -f "${LOCAL_MANIFEST}" ]] || die "Installation RP Bot introuvable : ${LOCAL_MANIFEST}"
+summary="$(/usr/bin/osascript -l JavaScript - "${LOCAL_MANIFEST}" <<'JXA'
+ObjC.import("Foundation");
+
+function run(argv) {
+  const filePath = argv[0];
+  const contents = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError($(filePath), $.NSUTF8StringEncoding, null));
+  if (contents === undefined) throw new Error("Lecture impossible : " + filePath);
+  const manifest = JSON.parse(contents);
+  const rpBot = manifest && manifest.components && manifest.components.rpBot;
+  if (!rpBot || typeof rpBot.activeVersion !== "string" || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(rpBot.activeVersion)) {
+    throw new Error("Aucune version RP Bot active dans le manifeste local.");
+  }
+  const backgrounds = manifest.components.roleplayBackgrounds;
+  if (backgrounds === null) return rpBot.activeVersion + "\n\n";
+  const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  if (!backgrounds || !semver.test(backgrounds.activeContentVersion) || !semver.test(backgrounds.activeFormatVersion)) {
+    throw new Error("Version du pack de décors actif invalide.");
+  }
+  return rpBot.activeVersion + "\n" + backgrounds.activeContentVersion + "\n" + backgrounds.activeFormatVersion;
+}
+JXA
+)" || die "Le manifeste local RP Bot est invalide."
+summary_lines=("${(@f)summary}")
+active_version="${summary_lines[1]:-}"
+backgrounds_content="${summary_lines[2]:-}"
+backgrounds_format="${summary_lines[3]:-}"
+active_path="${SUITE_ROOT}/apps/rp-bot/${active_version}"
+runtime_path="${active_path}/runtime/node"
+launcher_path="${active_path}/launcher.mjs"
+data_path="${SUITE_ROOT}/data/rp-bot"
+backgrounds_path=""
+
+[[ -x "${runtime_path}" && -f "${launcher_path}" ]] || die "Installation RP Bot ${active_version} incomplète : ${active_path}"
+/bin/mkdir -p "${data_path}"
+
+environment=("RP_BOT_DATA_DIR=${data_path}")
+if [[ -n "${backgrounds_content}" ]]; then
+  backgrounds_path="${SUITE_ROOT}/assets/roleplay-backgrounds/${backgrounds_content}-format-${backgrounds_format}"
+  [[ -d "${backgrounds_path}" ]] || die "Le pack de décors actif est introuvable : ${backgrounds_path}"
+  environment+=("RP_BOT_ROLEPLAY_BACKGROUNDS_DIR=${backgrounds_path}")
+fi
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  print -- "Version active : ${active_version}"
+  print -- "Données : ${data_path}"
+  print -- "Décors : ${backgrounds_path:-aucun}"
+  exit 0
+fi
+
+child_pid=""
+stop_child() {
+  [[ -z "${child_pid}" ]] || /bin/kill "${child_pid}" 2>/dev/null || true
+}
+trap stop_child INT TERM
+
+/usr/bin/env "${environment[@]}" "${runtime_path}" "${launcher_path}" &
+child_pid=$!
+browser_opened=0
+for attempt in {1..60}; do
+  if ! /bin/kill -0 "${child_pid}" 2>/dev/null; then
+    if wait "${child_pid}"; then exit 0; else exit $?; fi
+  fi
+  if /usr/bin/curl --silent --fail --max-time 1 "${APPLICATION_URL}/api/health" >/dev/null 2>&1; then
+    /usr/bin/open "${APPLICATION_URL}" >/dev/null 2>&1 || true
+    browser_opened=1
+    break
+  fi
+  /bin/sleep 0.5
+done
+(( browser_opened )) || print -u2 -- "[AVERTISSEMENT] RP Bot ne répond pas encore sur ${APPLICATION_URL}."
+if wait "${child_pid}"; then
+  child_exit=0
+else
+  child_exit=$?
+fi
+child_pid=""
+exit "${child_exit}"
+LAUNCHER
+    } > "${temporary}"
+    /bin/chmod 700 "${temporary}"
+    /bin/mv -f -- "${temporary}" "${launcher_path}"
+  }; then
+    /bin/rm -f -- "${temporary}" 2>/dev/null || true
+    print -u2 -- "[AVERTISSEMENT] Impossible d'écrire le lanceur ${launcher_path}."
+    return 0
+  fi
+  print -- "Lanceur créé : ${launcher_path}"
+  print -- "Vous pouvez déplacer le dossier RP Bot Suite complet."
+}
+
 cleanup() {
   if [[ -n "${SWAP_TARGET:-}" ]]; then
     rollback_swap || true
@@ -64,6 +195,7 @@ Usage : install-rp-bot-macos.command [options]
   --help                       Affiche cette aide
 
 Une sélection absente ne désinstalle jamais un composant existant.
+Par défaut, RP Bot Suite est créé à côté de ce script d'installation.
 EOF
 }
 
@@ -508,8 +640,8 @@ verify_download() {
 }
 
 verify_signature() {
-  local file_path="$1" status="$2" signature_url="$3"
-  [[ "${status}" == "signed" ]] || return 0
+  local file_path="$1" signature_status="$2" signature_url="$3"
+  [[ "${signature_status}" == "signed" ]] || return 0
   local minisign_bin="${RP_BOT_MINISIGN_BIN:-}"
   local public_key="${RP_BOT_MINISIGN_PUBLIC_KEY:-}"
   if [[ -z "${minisign_bin}" || ! -x "${minisign_bin}" || -z "${public_key}" ]]; then
@@ -643,7 +775,10 @@ atomic_local_update() {
     /bin/rm -f -- "${temporary}"
     die "Le manifeste local existant est invalide ; aucune écriture n'a été effectuée."
   }
-  /usr/bin/plutil -lint "${temporary}" >/dev/null || die "Écriture JSON locale invalide."
+  json_helper local-summary "${temporary}" "${SUITE_ROOT}" "${CHANNEL}" >/dev/null || {
+    /bin/rm -f -- "${temporary}"
+    die "Écriture JSON locale invalide."
+  }
   /bin/chmod 600 "${temporary}"
   /bin/mv -f -- "${temporary}" "${LOCAL_MANIFEST}"
   /bin/sync
@@ -776,18 +911,18 @@ prepare_preflight() {
 
   local app_disk=0 models_disk=0 memory_required=0 value
   if (( install_rp )); then
-    value="$(requirement_value "${summary}" rpBot requiredFreeDiskBytes)"; (( app_disk += value ))
-    value="$(requirement_value "${summary}" rpBot requiredMemoryBytes)"; (( memory_required = value > memory_required ? value : memory_required ))
+    value="$(requirement_value "${summary}" rpBot requiredFreeDiskBytes)"; app_disk=$(( app_disk + value ))
+    value="$(requirement_value "${summary}" rpBot requiredMemoryBytes)"; memory_required=$(( value > memory_required ? value : memory_required ))
     require_port_available "${RP_BOT_PORT}" "RP Bot"
   fi
   if (( install_pulid )); then
-    value="$(requirement_value "${summary}" pulid requiredFreeDiskBytes)"; (( app_disk += value ))
-    value="$(requirement_value "${summary}" pulidModels requiredFreeDiskBytes)"; (( models_disk += value ))
-    value="$(requirement_value "${summary}" pulid requiredMemoryBytes)"; (( memory_required = value > memory_required ? value : memory_required ))
+    value="$(requirement_value "${summary}" pulid requiredFreeDiskBytes)"; app_disk=$(( app_disk + value ))
+    value="$(requirement_value "${summary}" pulidModels requiredFreeDiskBytes)"; models_disk=$(( models_disk + value ))
+    value="$(requirement_value "${summary}" pulid requiredMemoryBytes)"; memory_required=$(( value > memory_required ? value : memory_required ))
     require_port_available "${PULID_PORT}" "PuLID"
   fi
   if (( install_backgrounds )); then
-    value="$(requirement_value "${summary}" roleplayBackgrounds requiredFreeDiskBytes)"; (( app_disk += value ))
+    value="$(requirement_value "${summary}" roleplayBackgrounds requiredFreeDiskBytes)"; app_disk=$(( app_disk + value ))
   fi
   require_disk_space "${SUITE_ROOT}" "${app_disk}" "les applications et décors sélectionnés"
   if (( install_pulid )); then
@@ -801,10 +936,9 @@ prepare_preflight() {
   require_connectivity GitHub "https://github.com/"
   if (( install_pulid )); then
     require_connectivity "Hugging Face" "https://huggingface.co/"
-    require_connectivity PyTorch "https://download.pytorch.org/"
-    require_connectivity Astral/uv "https://astral.sh/uv/"
-    require_connectivity "llama-cpp-python" "https://abetlen.github.io/llama-cpp-python/"
-    require_connectivity PyPI "https://pypi.org/simple/"
+    require_connectivity Astral/uv "https://astral.sh/uv/install.sh"
+    require_connectivity "llama-cpp-python Metal" "https://abetlen.github.io/llama-cpp-python/whl/metal"
+    require_connectivity PyPI "https://pypi.org/simple"
   fi
   local -a selected_components
   (( install_rp )) && selected_components+=(rp-bot)
@@ -845,9 +979,31 @@ install_rp_bot() {
   print -- "RP Bot ${version} installé et activé sans modifier ${SUITE_ROOT}/data/rp-bot."
 }
 
+create_pulid_bash32_compat_installer() {
+  local release_root="$1" source_path compat_path line replacements=0
+  source_path="${release_root}/install_macos.sh"
+  compat_path="${release_root}/.rp-bot-install-macos-compat.sh"
+  [[ -f "${source_path}" ]] || die "Installateur macOS PuLID absent."
+  : > "${compat_path}" || die "Impossible de préparer la compatibilité Bash 3.2 pour PuLID."
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" == '  "${PULID_EDITABLE_ARGS[@]}" \' ]]; then
+      print -r -- '  ${PULID_EDITABLE_ARGS[@]+"${PULID_EDITABLE_ARGS[@]}"} \' >> "${compat_path}"
+      replacements=$(( replacements + 1 ))
+    else
+      print -r -- "${line}" >> "${compat_path}"
+    fi
+  done < "${source_path}"
+  if (( replacements != 1 )); then
+    /bin/rm -f -- "${compat_path}"
+    die "Le correctif de compatibilité Bash 3.2 ne correspond pas exactement à l'installateur PuLID attendu ; aucune exécution effectuée."
+  fi
+  /bin/chmod 700 "${compat_path}" || die "Impossible de rendre exécutable l'installateur PuLID temporaire."
+  REPLY="${compat_path}"
+}
+
 install_pulid() {
   local summary="$1" current_version="$2"
-  local version file_name url size sha sig_status sig_url archive staging prepared target operation_kind
+  local version file_name url size sha sig_status sig_url archive staging prepared target operation_kind compat_installer
   version="$(json_get "${summary}" pulidVersion)"
   operation_kind="$([[ -z "${current_version}" ]] && print install || { [[ "${current_version}" == "${version}" ]] && print repair || print update; })"
   file_name="$(artifact_value "${summary}" pulid fileName)"
@@ -867,10 +1023,17 @@ install_pulid() {
   /bin/chmod +x "${prepared}/install_production_macos.sh" "${prepared}/install_macos.sh"
   target="${SUITE_ROOT}/apps/pulid/${version}"
   swap_in_directory "${prepared}" "${target}" "${staging}"
-  if ! PULID_MODELS_ROOT="${MODELS_ROOT}" "${target}/install_production_macos.sh"; then
+  create_pulid_bash32_compat_installer "${target}"
+  compat_installer="${REPLY}"
+  if ! PULID_MODELS_ROOT="${MODELS_ROOT}" "${compat_installer}" --production; then
+    /bin/rm -f -- "${compat_installer}"
     rollback_swap
     die "L'installation PuLID a échoué. Les modèles déjà valides ont été conservés dans ${MODELS_ROOT}."
   fi
+  /bin/rm -f -- "${compat_installer}" || {
+    rollback_swap
+    die "Impossible de supprimer l'adaptateur temporaire PuLID ; installation annulée."
+  }
   [[ -x "${target}/.venv/bin/pulid-gen" ]] || {
     rollback_swap
     die "Le contrôle de santé PuLID n'a pas produit le runtime attendu."
@@ -928,23 +1091,57 @@ run_self_test() {
   ! is_safe_archive_entry "../escape" || die "Self-test traversée en échec."
   ! is_safe_archive_entry "/absolute" || die "Self-test chemin absolu en échec."
   ! is_safe_archive_entry 'C:\\escape' || die "Self-test chemin Windows en échec."
+  verify_signature "${INSTALLER_PATH}" "unsigned-mvp" "" || die "Self-test signature MVP non signée en échec."
+  local zero_requirement=0 zero_memory_required=0
+  zero_memory_required=$(( zero_requirement > zero_memory_required ? zero_requirement : zero_memory_required ))
+  [[ "${zero_memory_required}" == "0" ]] || die "Self-test préflight sans prérequis mémoire en échec."
   local pointer manifest pointer_summary manifest_summary
-  pointer="${0:A:h:h}/../docs/distribution/examples/latest-beta-v1.example.json"
-  manifest="${0:A:h:h}/../docs/distribution/examples/rp-bot-suite-manifest-v1.example.json"
+  pointer="${INSTALLER_DIRECTORY:h}/../docs/distribution/examples/latest-beta-v1.example.json"
+  manifest="${INSTALLER_DIRECTORY:h}/../docs/distribution/examples/rp-bot-suite-manifest-v1.example.json"
   if [[ -f "${pointer}" && -f "${manifest}" ]]; then
     pointer_summary="$(json_helper pointer-summary "${pointer}" beta)"
     manifest_summary="$(json_helper manifest-summary "${manifest}" beta macos arm64)"
     [[ "$(print -r -- "${pointer_summary}" | /usr/bin/plutil -extract suiteVersion raw -o - -)" == "0.2.0-beta.1" ]] || die "Self-test pointeur en échec."
     [[ "$(print -r -- "${manifest_summary}" | /usr/bin/plutil -extract rpBotVersion raw -o - -)" == "0.2.0-beta.1" ]] || die "Self-test manifeste en échec."
   fi
-  local state_root local_path local_temporary now
-  state_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/rp-bot-installer-state-test.XXXXXX")"
-  local_path="${state_root}/installation.json"
-  local_temporary="${state_root}/installation.tmp.json"
+  local state_base state_root local_path now previous_suite_root previous_state_directory previous_local_manifest launcher_path launcher_output moved_root moved_launcher backgrounds_path moved_backgrounds_path
+  state_base="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/rp-bot-installer-state-test.XXXXXX")"
+  state_root="${state_base}/RP Bot Suite test"
+  /bin/mkdir -p "${state_root}"
+  state_root="${state_root:A}"
+  state_base="${state_base:A}"
+  previous_suite_root="${SUITE_ROOT}"
+  previous_state_directory="${STATE_DIRECTORY}"
+  previous_local_manifest="${LOCAL_MANIFEST}"
+  SUITE_ROOT="${state_root}"
+  STATE_DIRECTORY="${state_root}/state"
+  LOCAL_MANIFEST="${STATE_DIRECTORY}/installation.json"
+  /bin/mkdir -p "${STATE_DIRECTORY}"
+  local_path="${LOCAL_MANIFEST}"
   now="2026-09-15T12:00:00.000Z"
-  json_helper local-update "${local_path}" "${state_root}" beta activate-rp "${now}" 0.2.0-beta.1 "${state_root}/apps/rp-bot/0.2.0-beta.1" > "${local_temporary}"
-  /bin/mv -- "${local_temporary}" "${local_path}"
+  atomic_local_update operation self-test-operation rp-bot install downloading - 0.2.0-beta.1 "Téléchargement RP Bot en cours." resume,cancel
+  atomic_local_update activate-rp 0.2.0-beta.1 "${state_root}/apps/rp-bot/0.2.0-beta.1"
+  backgrounds_path="${state_root}/assets/roleplay-backgrounds/1.0.0-format-1.0.0"
+  atomic_local_update activate-backgrounds 1.0.0 1.0.0 "${backgrounds_path}"
   [[ "$(json_helper local-summary "${local_path}" "${state_root}" beta | /usr/bin/plutil -extract rpBotVersion raw -o - -)" == "0.2.0-beta.1" ]] || die "Self-test manifeste local en échec."
+  /bin/mkdir -p "${state_root}/apps/rp-bot/0.2.0-beta.1/runtime" "${backgrounds_path}"
+  print -n -- 'self-test' > "${state_root}/apps/rp-bot/0.2.0-beta.1/launcher.mjs"
+  print -r -- '#!/bin/sh' > "${state_root}/apps/rp-bot/0.2.0-beta.1/runtime/node"
+  /bin/chmod 700 "${state_root}/apps/rp-bot/0.2.0-beta.1/runtime/node"
+  write_user_launcher "${state_root}"
+  launcher_path="${state_root}/${USER_LAUNCHER_NAME}"
+  [[ -x "${launcher_path}" ]] || die "Self-test création du lanceur portable en échec."
+  launcher_output="$("${launcher_path}" --self-test)"
+  [[ "${launcher_output}" == *"Version active : 0.2.0-beta.1"* && "${launcher_output}" == *"Données : ${state_root}/data/rp-bot"* && "${launcher_output}" == *"Décors : ${backgrounds_path}"* ]] || die "Self-test contenu du lanceur portable en échec."
+  moved_root="${state_base}/RP Bot Suite déplacée"
+  /bin/cp -R -- "${state_root}" "${moved_root}"
+  moved_launcher="${moved_root}/${USER_LAUNCHER_NAME}"
+  moved_backgrounds_path="${moved_root}/assets/roleplay-backgrounds/1.0.0-format-1.0.0"
+  launcher_output="$("${moved_launcher}" --self-test)"
+  [[ "${launcher_output}" == *"Version active : 0.2.0-beta.1"* && "${launcher_output}" == *"Données : ${moved_root}/data/rp-bot"* && "${launcher_output}" == *"Décors : ${moved_backgrounds_path}"* ]] || die "Self-test déplacement de la suite portable en échec."
+  SUITE_ROOT="${previous_suite_root}"
+  STATE_DIRECTORY="${previous_state_directory}"
+  LOCAL_MANIFEST="${previous_local_manifest}"
   local archive_source archive_path archive_staging archive_root
   archive_source="${state_root}/archive-source"
   /bin/mkdir -p "${archive_source}/sample-root"
@@ -955,6 +1152,30 @@ run_self_test() {
   extract_archive "${archive_path}" "${archive_staging}" self-test
   single_archive_root "${archive_staging}"; archive_root="${REPLY}"
   [[ "$(<"${archive_root}/file.txt")" == "verified" ]] || die "Self-test extraction sûre en échec."
+  local compat_root compat_source compat_installer compat_source_sha compat_output
+  compat_root="${state_root}/pulid-bash32"
+  compat_source="${compat_root}/install_macos.sh"
+  /bin/mkdir -p "${compat_root}"
+  {
+    print -r -- '#!/usr/bin/env bash'
+    print -r -- 'set -u'
+    print -r -- 'PULID_EDITABLE_ARGS=()'
+    print -r -- 'if [[ "${1:-}" == "--development" ]]; then PULID_EDITABLE_ARGS=(-e); fi'
+    print -r -- 'printf "%s\n" "compat-ok" \'
+    print -r -- '  "${PULID_EDITABLE_ARGS[@]}" \'
+    print -r -- '  > "${BASH_SOURCE[0]}.output"'
+  } > "${compat_source}"
+  compat_source_sha="$(file_sha256 "${compat_source}")"
+  create_pulid_bash32_compat_installer "${compat_root}"
+  compat_installer="${REPLY}"
+  [[ "$(file_sha256 "${compat_source}")" == "${compat_source_sha}" ]] || die "Self-test intégrité de l'installateur PuLID original en échec."
+  /bin/bash "${compat_installer}"
+  compat_output="$(<"${compat_installer}.output")"
+  [[ "${compat_output}" == "compat-ok" ]] || die "Self-test compatibilité Bash 3.2 PuLID production en échec."
+  /bin/bash "${compat_installer}" --development
+  compat_output="$(<"${compat_installer}.output")"
+  [[ "${compat_output}" == $'compat-ok\n-e' ]] || die "Self-test compatibilité Bash 3.2 PuLID développement en échec."
+  /bin/rm -f -- "${compat_installer}" "${compat_installer}.output"
   local swap_parent swap_target swap_prepared
   swap_parent="${state_root}/swap"
   swap_target="${swap_parent}/target"
@@ -965,7 +1186,7 @@ run_self_test() {
   swap_in_directory "${swap_prepared}" "${swap_target}" "${swap_parent}/unused-staging"
   rollback_swap
   [[ "$(<"${swap_target}/value")" == "old" ]] || die "Self-test rollback côte à côte en échec."
-  /bin/rm -rf -- "${state_root}"
+  /bin/rm -rf -- "${state_base}"
   print -- "Self-test installateur macOS : OK"
 }
 
@@ -981,6 +1202,7 @@ main() {
   LOCAL_MANIFEST="${STATE_DIRECTORY}/installation.json"
   /bin/mkdir -p "${STATE_DIRECTORY}" "${DOWNLOAD_DIRECTORY}"
   /bin/chmod 700 "${STATE_DIRECTORY}" "${DOWNLOAD_DIRECTORY}" 2>/dev/null || true
+  print -- "Dossier de suite : ${SUITE_ROOT}"
 
   notice "Lecture du canal ${CHANNEL}"
   local pointer_path="${TEMPORARY_ROOT}/latest-${CHANNEL}.json"
@@ -1072,6 +1294,12 @@ main() {
   (( install_rp )) && install_rp_bot "${suite_summary}" "${current_rp}"
   (( install_pulid )) && install_pulid "${suite_summary}" "${current_pulid}"
   (( install_backgrounds )) && install_backgrounds "${suite_summary}"
+
+  local installed_rp
+  installed_rp="$(json_helper local-summary "${LOCAL_MANIFEST}" "${SUITE_ROOT}" "${CHANNEL}" | /usr/bin/plutil -extract rpBotVersion raw -o - -)"
+  if [[ -n "${installed_rp}" ]]; then
+    write_user_launcher "${SUITE_ROOT}"
+  fi
 
   notice "Installation terminée"
   print -- "Manifeste local : ${LOCAL_MANIFEST}"
