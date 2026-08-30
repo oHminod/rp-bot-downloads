@@ -49,6 +49,7 @@ $script:UpdaterLauncherName = "Mettre a jour RP Bot.bat"
 $script:SuiteRuntimeDirectory = Join-Path $Root "runtimes\rp-bot-suite"
 $script:SuiteLauncherPath = Join-Path $script:SuiteRuntimeDirectory "suite-launcher.mjs"
 $script:LauncherManifestReaderName = "read-active-version.ps1"
+$script:PuLIDRuntimeRepairerName = "repair-pulid-runtime.ps1"
 $script:StateDirectory = Join-Path $Root "state"
 $script:DownloadDirectory = Join-Path $script:StateDirectory "downloads"
 $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
@@ -119,7 +120,10 @@ param(
     [string]$ManifestPath,
     [Parameter(Mandatory = $true)]
     [ValidateSet("rp-bot", "pulid")]
-    [string]$Component
+    [string]$Component,
+    [ValidateSet("version", "models-path", "previous-suite-root")]
+    [string]$Field = "version",
+    [string]$SuiteRoot
 )
 
 Set-StrictMode -Version Latest
@@ -128,6 +132,7 @@ $ErrorActionPreference = "Stop"
 try {
     $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($Component -eq "rp-bot") {
+        if ($Field -ne "version") { throw "RP Bot exposes only its active version." }
         $version = [string]$manifest.components.rpBot.activeVersion
     }
     else {
@@ -140,7 +145,38 @@ try {
     if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
         throw "The active component version is not valid SemVer."
     }
-    [Console]::Out.WriteLine($version)
+    $recordedRoot = $null
+    if ($Component -eq "pulid" -and $Field -ne "version") {
+        $recordedDataPath = [IO.Path]::GetFullPath([string]$manifest.paths.rpBotData)
+        $dataDirectory = [IO.Directory]::GetParent($recordedDataPath)
+        $candidate = if ($null -eq $dataDirectory) { $null } else { $dataDirectory.Parent }
+        if ($null -ne $candidate) {
+            $expectedDataPath = [IO.Path]::GetFullPath((Join-Path $candidate.FullName "data\rp-bot"))
+            $pathSeparators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+            if ([string]::Equals($recordedDataPath.TrimEnd($pathSeparators), $expectedDataPath.TrimEnd($pathSeparators), [StringComparison]::OrdinalIgnoreCase)) {
+                $recordedRoot = $candidate.FullName
+            }
+        }
+    }
+    if ($Field -eq "version") {
+        [Console]::Out.WriteLine($version)
+    }
+    elseif ($Field -eq "previous-suite-root") {
+        if ($null -eq $recordedRoot) { throw "The recorded suite root cannot be inferred." }
+        [Console]::Out.WriteLine($recordedRoot)
+    }
+    else {
+        $modelsPath = [IO.Path]::GetFullPath([string]$pulid.modelsPath)
+        if (-not [string]::IsNullOrWhiteSpace($SuiteRoot) -and $null -ne $recordedRoot) {
+            $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+            $recordedPrefix = $recordedRoot.TrimEnd($separators) + [IO.Path]::DirectorySeparatorChar
+            if ($modelsPath.StartsWith($recordedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                $relativeModelsPath = $modelsPath.Substring($recordedPrefix.Length)
+                $modelsPath = Join-Path ([IO.Path]::GetFullPath($SuiteRoot)) $relativeModelsPath
+            }
+        }
+        [Console]::Out.WriteLine($modelsPath)
+    }
 }
 catch {
     [Console]::Error.WriteLine($_.Exception.Message)
@@ -161,6 +197,64 @@ catch {
         Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Write-PuLIDRuntimeRepairer([string]$SuiteRoot) {
+    $runtimeDirectory = Join-Path $SuiteRoot "runtimes\rp-bot-suite"
+    New-Item -ItemType Directory -Path $runtimeDirectory -Force | Out-Null
+    $repairerPath = Join-Path $runtimeDirectory $script:PuLIDRuntimeRepairerName
+    $contents = @'
+# RP_BOT_MANAGED_PULID_RUNTIME_REPAIRER
+#requires -Version 5.1
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$VenvPath,
+    [Parameter(Mandatory = $true)]
+    [string]$PreviousSuiteRoot,
+    [Parameter(Mandatory = $true)]
+    [string]$SuiteRoot
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+try {
+    $pathSeparators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $previousRoot = [IO.Path]::GetFullPath($PreviousSuiteRoot).TrimEnd($pathSeparators)
+    $currentRoot = [IO.Path]::GetFullPath($SuiteRoot).TrimEnd($pathSeparators)
+    if ([string]::Equals($previousRoot, $currentRoot, [StringComparison]::OrdinalIgnoreCase)) { exit 0 }
+    $configurationPath = Join-Path ([IO.Path]::GetFullPath($VenvPath)) "pyvenv.cfg"
+    if (-not (Test-Path -LiteralPath $configurationPath -PathType Leaf)) { exit 0 }
+    $contents = [IO.File]::ReadAllText($configurationPath)
+    $evaluator = [Text.RegularExpressions.MatchEvaluator]{ param($match) $currentRoot }
+    $updated = [Text.RegularExpressions.Regex]::Replace(
+        $contents,
+        [Text.RegularExpressions.Regex]::Escape($previousRoot),
+        $evaluator,
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    if ($updated -ne $contents) {
+        $temporary = "$configurationPath.$([Guid]::NewGuid()).tmp"
+        try {
+            [IO.File]::WriteAllText($temporary, $updated, (New-Object Text.UTF8Encoding($false)))
+            [IO.File]::Copy($temporary, $configurationPath, $true)
+        }
+        finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+'@
+    $temporary = Join-Path $runtimeDirectory (".{0}.{1}.tmp" -f $script:PuLIDRuntimeRepairerName, [Guid]::NewGuid())
+    try {
+        [IO.File]::WriteAllText($temporary, $contents, (New-Object Text.UTF8Encoding($true)))
+        [IO.File]::Copy($temporary, $repairerPath, $true)
+    }
+    finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
 }
 
 function Assert-ExactProperties($Value, [string[]]$Expected, [string]$Label) {
@@ -939,6 +1033,7 @@ function Write-PuLIDLaunchers([string]$SuiteRoot, $Local) {
     Assert-SemVer $version "Lanceur PuLID.version"
     New-Item -ItemType Directory -Path $SuiteRoot -Force | Out-Null
     Write-LauncherManifestReader $SuiteRoot
+    Write-PuLIDRuntimeRepairer $SuiteRoot
 
     foreach ($launcher in @(
         [pscustomobject]@{ Name = $script:PuLIDLocalLauncherName; Mode = "local"; NetworkArgument = "" },
@@ -959,29 +1054,44 @@ function Write-PuLIDLaunchers([string]$SuiteRoot, $Local) {
             ('set "PULID_LAUNCH_MODE=' + $launcher.Mode + '"'),
             'set "PULID_MANIFEST=%~dp0state\installation.json"',
             'set "PULID_MANIFEST_READER=%~dp0runtimes\rp-bot-suite\read-active-version.ps1"',
+            'set "PULID_RUNTIME_REPAIRER=%~dp0runtimes\rp-bot-suite\repair-pulid-runtime.ps1"',
             'if not exist "%PULID_MANIFEST%" (',
             '  echo [ERREUR] Installation PuLID introuvable : %PULID_MANIFEST%',
             '  exit /b 1',
             ')',
             'if not exist "%PULID_MANIFEST_READER%" ( echo [ERREUR] Lecteur du manifeste introuvable. & exit /b 1 )',
             'for /f "usebackq delims=" %%V in (`powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PULID_MANIFEST_READER%" -ManifestPath "%PULID_MANIFEST%" -Component pulid`) do set "PULID_ACTIVE_VERSION=%%V"',
+            'for /f "usebackq delims=" %%M in (`powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PULID_MANIFEST_READER%" -ManifestPath "%PULID_MANIFEST%" -Component pulid -Field models-path -SuiteRoot "%~dp0."`) do set "PULID_MODELS_PATH=%%M"',
+            'for /f "usebackq delims=" %%R in (`powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PULID_MANIFEST_READER%" -ManifestPath "%PULID_MANIFEST%" -Component pulid -Field previous-suite-root`) do set "PULID_PREVIOUS_SUITE_ROOT=%%R"',
             'if not defined PULID_ACTIVE_VERSION (',
             '  echo [ERREUR] Aucune version PuLID locale geree active.',
             '  exit /b 1',
             ')',
+            'if not defined PULID_MODELS_PATH ( echo [ERREUR] Dossier de modeles PuLID introuvable. & exit /b 1 )',
+            'if not defined PULID_PREVIOUS_SUITE_ROOT ( echo [ERREUR] Ancienne racine de suite introuvable. & exit /b 1 )',
             'if /i "%~1"=="--self-test" (',
             '  echo Version active : %PULID_ACTIVE_VERSION%',
             '  echo Racine : %~dp0',
+            '  echo Modeles : %PULID_MODELS_PATH%',
             '  echo Mode : %PULID_LAUNCH_MODE%',
             '  exit /b 0',
             ')',
-            'set "PULID_START=%~dp0apps\pulid\%PULID_ACTIVE_VERSION%\start_windows.bat"',
-            'if not exist "%PULID_START%" (',
+            'set "PULID_RELEASE=%~dp0apps\pulid\%PULID_ACTIVE_VERSION%"',
+            'set "PULID_PYTHON=%PULID_RELEASE%\.venv\Scripts\python.exe"',
+            'if not exist "%PULID_RUNTIME_REPAIRER%" ( echo [ERREUR] Reparateur de runtime PuLID introuvable. & exit /b 1 )',
+            'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PULID_RUNTIME_REPAIRER%" -VenvPath "%PULID_RELEASE%\.venv" -PreviousSuiteRoot "%PULID_PREVIOUS_SUITE_ROOT%" -SuiteRoot "%~dp0."',
+            'if errorlevel 1 ( echo [ERREUR] Impossible de recalculer la venv PuLID. & exit /b 1 )',
+            'if not exist "%PULID_PYTHON%" (',
             '  echo [ERREUR] Installation PuLID incomplete dans %~dp0',
             '  exit /b 1',
             ')',
+            'set "PULID_PROJECT_ROOT=%PULID_RELEASE%"',
+            'set "PULID_MODELS_ROOT=%PULID_MODELS_PATH%"',
+            'set "VIRTUAL_ENV=%PULID_RELEASE%\.venv"',
+            'set "PULID_TORCH_DLL_DIR=%PULID_RELEASE%\.venv\Lib\site-packages\torch\lib"',
+            'set "PATH=%PULID_TORCH_DLL_DIR%;%VIRTUAL_ENV%\Scripts;%PATH%"',
             $(if ($launcher.Mode -eq "local") { 'for %%A in (%*) do if /i "%%~A"=="--network" ( echo [ERREUR] Utilisez Lancer PuLID reseau.bat pour le mode reseau. & exit /b 1 )' } else { 'echo [AVERTISSEMENT] Le port 12693 doit rester limite a un reseau de confiance.' }),
-            ('call "%PULID_START%" ' + $launcher.NetworkArgument + '%*'),
+            ('"%PULID_PYTHON%" -m pulid_app.server --host 127.0.0.1 --port 12693 --device cuda --dtype float16 --offload none ' + $launcher.NetworkArgument + '%*'),
             'exit /b %ERRORLEVEL%',
             ''
         )
@@ -1089,10 +1199,12 @@ function Invoke-SelfTest {
                 rpBot = [pscustomobject]@{ activeVersion = "0.2.0-beta.1" }
                 pulid = [pscustomobject]@{
                     installationType = "managed-local"
+                    modelsPath = (Join-Path $selfTestRoot "models\PuLID_models")
                     managedInstallation = [pscustomobject]@{ activeVersion = "0.1.0" }
                 }
                 roleplayBackgrounds = [pscustomobject]@{ activeContentVersion = "1.0.0"; activeFormatVersion = "1.0.0" }
             }
+            paths = [pscustomobject]@{ rpBotData = (Join-Path $selfTestRoot "data\rp-bot") }
         }
         $launcherStateDirectory = Join-Path $selfTestRoot "state"
         $launcherManifestPath = Join-Path $launcherStateDirectory "installation.json"
@@ -1102,6 +1214,14 @@ function Invoke-SelfTest {
         Write-UserLauncher $selfTestRoot $launcherLocal
         Write-UpdaterLauncher $selfTestRoot $launcherLocal
         Write-PuLIDLaunchers $selfTestRoot $launcherLocal
+        $fixtureVenv = Join-Path $selfTestRoot "apps\pulid\0.1.0\.venv"
+        $fixturePythonHome = Join-Path $selfTestRoot "models\PuLID_models\other\uv-python-windows\cpython-3.11"
+        New-Item -ItemType Directory -Path $fixtureVenv -Force | Out-Null
+        [IO.File]::WriteAllText(
+            (Join-Path $fixtureVenv "pyvenv.cfg"),
+            ("home = $fixturePythonHome`r`nexecutable = $fixturePythonHome\python.exe`r`n"),
+            (New-Object Text.UTF8Encoding($false))
+        )
         $launcherPath = Join-Path $selfTestRoot $script:UserLauncherName
         $launcherContents = [IO.File]::ReadAllText($launcherPath)
         if (-not $launcherContents.Contains('set "RP_BOT_DATA_DIR=%~dp0data\rp-bot"') -or
@@ -1122,8 +1242,9 @@ function Invoke-SelfTest {
         $pulidNetworkLauncher = Join-Path $selfTestRoot $script:PuLIDNetworkLauncherName
         $pulidLocalContents = [IO.File]::ReadAllText($pulidLocalLauncher)
         $pulidNetworkContents = [IO.File]::ReadAllText($pulidNetworkLauncher)
-        if (-not $pulidLocalContents.Contains('call "%PULID_START%" %*') -or
-            -not $pulidNetworkContents.Contains('call "%PULID_START%" --network %*')) {
+        if (-not $pulidLocalContents.Contains('"%PULID_PYTHON%" -m pulid_app.server') -or
+            $pulidLocalContents.Contains('--offload none --network %*') -or
+            -not $pulidNetworkContents.Contains('--offload none --network %*')) {
             Fail "Self-test arguments des lanceurs PuLID en échec."
         }
         $pulidLocalOutput = @(& $pulidLocalLauncher --self-test 2>&1) -join "`n"
@@ -1146,6 +1267,23 @@ function Invoke-SelfTest {
         $movedPulidNetworkOutput = @(& $movedPulidNetworkLauncher --self-test 2>&1) -join "`n"
         if ($LASTEXITCODE -ne 0 -or $movedPulidNetworkOutput -notlike "*Racine : $movedRoot\*") {
             Fail ("Self-test déplacement du lanceur PuLID réseau en échec.`r`n" + $movedPulidNetworkOutput)
+        }
+        if ($movedPulidNetworkOutput -notlike "*Modeles : $movedRoot\models\PuLID_models*") {
+            Fail ("Self-test rebase des modèles PuLID Windows en échec.`r`n" + $movedPulidNetworkOutput)
+        }
+        $movedVenv = Join-Path $movedRoot "apps\pulid\0.1.0\.venv"
+        $movedRepairer = Join-Path $movedRoot "runtimes\rp-bot-suite\$($script:PuLIDRuntimeRepairerName)"
+        $repairOutput = @(
+            & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $movedRepairer `
+                -VenvPath $movedVenv -PreviousSuiteRoot $selfTestRoot -SuiteRoot $movedRoot 2>&1
+        ) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+            Fail ("Self-test réparation de la venv PuLID Windows en échec.`r`n" + $repairOutput)
+        }
+        $movedVenvConfiguration = [IO.File]::ReadAllText((Join-Path $movedVenv "pyvenv.cfg"))
+        if ($movedVenvConfiguration.IndexOf($movedRoot, [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+            $movedVenvConfiguration.IndexOf($selfTestRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            Fail "Self-test recalage de pyvenv.cfg Windows en échec."
         }
         $movedUpdaterLauncher = Join-Path $movedRoot $script:UpdaterLauncherName
         $movedUpdaterOutput = @(& $movedUpdaterLauncher --self-test 2>&1) -join "`n"

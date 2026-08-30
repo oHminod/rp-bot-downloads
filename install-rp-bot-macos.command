@@ -243,7 +243,7 @@ die() {
 }
 
 [[ -f "${LOCAL_MANIFEST}" ]] || die "Installation PuLID introuvable : ${LOCAL_MANIFEST}"
-summary="$(/usr/bin/osascript -l JavaScript - "${LOCAL_MANIFEST}" <<'JXA'
+summary="$(/usr/bin/osascript -l JavaScript - "${LOCAL_MANIFEST}" "${SUITE_ROOT}" <<'JXA'
 ObjC.import("Foundation");
 function run(argv) {
   const contents = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError($(argv[0]), $.NSUTF8StringEncoding, null));
@@ -255,15 +255,56 @@ function run(argv) {
   if (!managed || !semver.test(managed.activeVersion) || typeof pulid.modelsPath !== "string" || pulid.modelsPath.length === 0) {
     throw new Error("Aucune version PuLID locale gérée n'est active.");
   }
-  return managed.activeVersion + "\n" + pulid.modelsPath;
+  let modelsPath = pulid.modelsPath;
+  let recordedSuiteRoot = "";
+  const recordedDataPath = manifest.paths && manifest.paths.rpBotData;
+  const dataSuffix = "/data/rp-bot";
+  if (typeof recordedDataPath === "string" && recordedDataPath.endsWith(dataSuffix)) {
+    recordedSuiteRoot = recordedDataPath.slice(0, -dataSuffix.length);
+    const recordedPrefix = recordedSuiteRoot + "/";
+    if (modelsPath.startsWith(recordedPrefix)) {
+      modelsPath = argv[1] + "/" + modelsPath.slice(recordedPrefix.length);
+    }
+  }
+  return managed.activeVersion + "\n" + modelsPath + "\n" + recordedSuiteRoot;
 }
 JXA
 )" || die "Le manifeste local PuLID est invalide."
 summary_lines=("${(@f)summary}")
 active_version="${summary_lines[1]:-}"
 models_path="${summary_lines[2]:-}"
+previous_suite_root="${summary_lines[3]:-}"
 release_path="${SUITE_ROOT}/apps/pulid/${active_version}"
-start_path="${release_path}/start_pulid_server.sh"
+python_path="${release_path}/.venv/bin/python"
+
+repair_portable_venv() {
+  [[ -n "${previous_suite_root}" && "${previous_suite_root}" != "${SUITE_ROOT}" ]] || return 0
+  local configuration_path configuration_contents temporary mode target rebased_target temporary_link
+  configuration_path="${release_path}/.venv/pyvenv.cfg"
+  if [[ -f "${configuration_path}" ]]; then
+    configuration_contents="$(<"${configuration_path}")"
+    if [[ "${configuration_contents}" == *"${previous_suite_root}"* ]]; then
+      temporary="$(/usr/bin/mktemp "${configuration_path}.XXXXXX")" || die "Impossible de réparer la venv PuLID."
+      PULID_PREVIOUS_SUITE_ROOT="${previous_suite_root}" \
+        PULID_CURRENT_SUITE_ROOT="${SUITE_ROOT}" \
+        /usr/bin/perl -0777 -pe 's/\Q$ENV{PULID_PREVIOUS_SUITE_ROOT}\E/$ENV{PULID_CURRENT_SUITE_ROOT}/g' \
+        "${configuration_path}" > "${temporary}" || die "Impossible de recalculer pyvenv.cfg."
+      mode="$(/usr/bin/stat -f '%Lp' "${configuration_path}")"
+      /bin/chmod "${mode}" "${temporary}"
+      /bin/mv -f "${temporary}" "${configuration_path}"
+    fi
+  fi
+  if [[ -L "${python_path}" ]]; then
+    target="$(/usr/bin/readlink "${python_path}")"
+    if [[ "${target}" == "${previous_suite_root}/"* ]]; then
+      rebased_target="${SUITE_ROOT}${target#"${previous_suite_root}"}"
+      [[ -x "${rebased_target}" ]] || die "Runtime Python PuLID déplacé introuvable : ${rebased_target}"
+      temporary_link="${python_path}.$$.tmp"
+      /bin/ln -s "${rebased_target}" "${temporary_link}"
+      /bin/mv -f "${temporary_link}" "${python_path}"
+    fi
+  fi
+}
 
 if [[ "${1:-}" == "--self-test" ]]; then
   print -- "Version active : ${active_version}"
@@ -273,12 +314,20 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit 0
 fi
 
-[[ -f "${start_path}" ]] || die "Lanceur PuLID actif introuvable : ${start_path}"
+repair_portable_venv
+[[ -x "${python_path}" ]] || die "Runtime Python PuLID actif introuvable : ${python_path}"
 if [[ "${PULID_LAUNCH_MODE}" == "local" ]]; then
   for argument in "$@"; do
     [[ "${argument}" != "--network" ]] || die "Le mode réseau est réservé au lanceur PuLID réseau."
   done
-  exec /usr/bin/env "PULID_MODELS_ROOT=${models_path}" /bin/bash "${start_path}" "$@"
+  exec /usr/bin/env \
+    "PULID_MODELS_ROOT=${models_path}" \
+    "PULID_PROJECT_ROOT=${release_path}" \
+    "VIRTUAL_ENV=${release_path}/.venv" \
+    "PATH=${release_path}/.venv/bin:${PATH:-/usr/bin:/bin}" \
+    "${python_path}" -m pulid_app.server \
+    --host 127.0.0.1 --port 12693 --device mps \
+    --cors-origin http://localhost:8800 "$@"
 fi
 
 print -- "[AVERTISSEMENT] Mode réseau avancé : PuLID écoutera sur le LAN."
@@ -287,7 +336,14 @@ for interface in en0 en1; do
   address="$(/usr/sbin/ipconfig getifaddr "${interface}" 2>/dev/null || true)"
   [[ -z "${address}" ]] || print -- "  http://${address}:12693"
 done
-exec /usr/bin/env "PULID_MODELS_ROOT=${models_path}" /bin/bash "${start_path}" "${PULID_NETWORK_ARGUMENT}" "$@"
+exec /usr/bin/env \
+  "PULID_MODELS_ROOT=${models_path}" \
+  "PULID_PROJECT_ROOT=${release_path}" \
+  "VIRTUAL_ENV=${release_path}/.venv" \
+  "PATH=${release_path}/.venv/bin:${PATH:-/usr/bin:/bin}" \
+  "${python_path}" -m pulid_app.server \
+  --host 127.0.0.1 --port 12693 --device mps \
+  --cors-origin http://localhost:8800 "${PULID_NETWORK_ARGUMENT}" "$@"
 PULID_LAUNCHER
     } > "${temporary}"
     /bin/chmod 700 "${temporary}"
@@ -1259,7 +1315,7 @@ run_self_test() {
     [[ "$(print -r -- "${pointer_summary}" | /usr/bin/plutil -extract suiteVersion raw -o - -)" == "0.2.0-beta.1" ]] || die "Self-test pointeur en échec."
     [[ "$(print -r -- "${manifest_summary}" | /usr/bin/plutil -extract rpBotVersion raw -o - -)" == "0.2.0-beta.1" ]] || die "Self-test manifeste en échec."
   fi
-  local state_base state_root local_path now previous_suite_root previous_state_directory previous_local_manifest launcher_path launcher_output moved_root moved_launcher backgrounds_path moved_backgrounds_path pulid_local_launcher pulid_network_launcher updater_launcher
+  local state_base state_root local_path now previous_suite_root previous_state_directory previous_local_manifest launcher_path launcher_output moved_root moved_launcher backgrounds_path moved_backgrounds_path pulid_local_launcher pulid_network_launcher updater_launcher pulid_private_python moved_pulid_python
   state_base="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/rp-bot-installer-state-test.XXXXXX")"
   state_root="${state_base}/RP Bot Suite test"
   /bin/mkdir -p "${state_root}"
@@ -1282,8 +1338,15 @@ run_self_test() {
   [[ "$(json_helper local-summary "${local_path}" "${state_root}" beta | /usr/bin/plutil -extract rpBotVersion raw -o - -)" == "0.2.0-beta.1" ]] || die "Self-test manifeste local en échec."
   /bin/mkdir -p "${state_root}/apps/rp-bot/0.2.0-beta.1/runtime" "${backgrounds_path}"
   print -n -- 'self-test' > "${state_root}/apps/rp-bot/0.2.0-beta.1/launcher.mjs"
-  /bin/mkdir -p "${state_root}/apps/pulid/0.1.0" "${state_root}/models/PuLID_models"
-  print -r -- '#!/usr/bin/env bash' > "${state_root}/apps/pulid/0.1.0/start_pulid_server.sh"
+  pulid_private_python="${state_root}/models/PuLID_models/other/uv-python-macos/cpython-3.11/bin/python3.11"
+  /bin/mkdir -p "${state_root}/apps/pulid/0.1.0/.venv/bin" "${pulid_private_python:h}"
+  {
+    print -r -- '#!/bin/sh'
+    print -r -- 'exit 0'
+  } > "${pulid_private_python}"
+  /bin/chmod 700 "${pulid_private_python}"
+  /bin/ln -s "${pulid_private_python}" "${state_root}/apps/pulid/0.1.0/.venv/bin/python"
+  print -r -- "home = ${pulid_private_python:h}" > "${state_root}/apps/pulid/0.1.0/.venv/pyvenv.cfg"
   print -r -- '#!/bin/sh' > "${state_root}/apps/rp-bot/0.2.0-beta.1/runtime/node"
   /bin/chmod 700 "${state_root}/apps/rp-bot/0.2.0-beta.1/runtime/node"
   write_user_launcher "${state_root}"
@@ -1310,7 +1373,11 @@ run_self_test() {
   launcher_output="$("${moved_launcher}" --self-test)"
   [[ "${launcher_output}" == *"Version active : 0.2.0-beta.1"* && "${launcher_output}" == *"Données : ${moved_root}/data/rp-bot"* && "${launcher_output}" == *"Décors : ${moved_backgrounds_path}"* ]] || die "Self-test déplacement de la suite portable en échec."
   launcher_output="$("${moved_root}/${PULID_NETWORK_LAUNCHER_NAME}" --self-test)"
-  [[ "${launcher_output}" == *"Racine : ${moved_root}"* && "${launcher_output}" == *"Mode : reseau"* ]] || die "Self-test déplacement du lanceur PuLID réseau macOS en échec."
+  [[ "${launcher_output}" == *"Racine : ${moved_root}"* && "${launcher_output}" == *"Modèles : ${moved_root}/models/PuLID_models"* && "${launcher_output}" == *"Mode : reseau"* ]] || die "Self-test déplacement du lanceur PuLID réseau macOS en échec."
+  "${moved_root}/${PULID_LOCAL_LAUNCHER_NAME}" || die "Self-test runtime PuLID déplacé macOS en échec."
+  moved_pulid_python="${moved_root}/models/PuLID_models/other/uv-python-macos/cpython-3.11/bin/python3.11"
+  [[ "$(/usr/bin/readlink "${moved_root}/apps/pulid/0.1.0/.venv/bin/python")" == "${moved_pulid_python}" ]] || die "Self-test lien Python PuLID déplacé macOS en échec."
+  /usr/bin/grep -Fq -- "home = ${moved_pulid_python:h}" "${moved_root}/apps/pulid/0.1.0/.venv/pyvenv.cfg" || die "Self-test pyvenv PuLID déplacé macOS en échec."
   launcher_output="$("${moved_root}/${UPDATER_LAUNCHER_NAME}" --self-test)"
   [[ "${launcher_output}" == *"Racine : ${moved_root}"* && "${launcher_output}" == *"Demande : ${moved_root}/state/update-request.json"* ]] || die "Self-test déplacement du lanceur updater macOS en échec."
   SUITE_ROOT="${previous_suite_root}"
