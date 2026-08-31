@@ -29,8 +29,14 @@ CHANNEL="beta"
 SUITE_ROOT="${DEFAULT_SUITE_ROOT}"
 MODELS_ROOT=""
 SELECTION=""
+UNINSTALL_SELECTION=""
 BACKGROUNDS_CHOICE="ask"
 ACCEPT_UNSIGNED=0
+DELETE_RP_DATA=0
+DELETE_PULID_MODELS=0
+CONFIRM_UNINSTALL=0
+CONFIRM_DATA_DELETION=0
+CONFIRM_MODELS_DELETION=0
 SELF_TEST=0
 TEMPORARY_ROOT=""
 LOCAL_MANIFEST=""
@@ -396,10 +402,17 @@ Usage : install-rp-bot-macos.command [options]
 
   --channel stable|beta        Canal de mise à jour (beta par défaut pour le MVP)
   --select rp-bot|pulid|both   Composants à installer ou réparer
+  --uninstall rp-bot|pulid|both
+                               Désinstalle explicitement les binaires, sans réseau
   --root CHEMIN                Racine de RP Bot Suite
   --models-root CHEMIN         Dossier permanent PuLID_models
   --backgrounds yes|no|ask     Pack de décors recommandé avec RP Bot
   --accept-unsigned-mvp        Confirme une prerelease MVP non signée
+  --delete-rp-data             Supprime aussi les données RP Bot sélectionnées
+  --delete-pulid-models        Supprime aussi le dossier de modèles PuLID sélectionné
+  --confirm-uninstall          Confirme la désinstallation non interactive
+  --confirm-data-deletion      Confirme séparément la suppression des données RP Bot
+  --confirm-models-deletion    Confirme séparément la suppression des modèles PuLID
   --self-test                  Contrôles locaux sans réseau ni installation
   --help                       Affiche cette aide
 
@@ -421,6 +434,11 @@ parse_arguments() {
         SELECTION="$2"
         shift 2
         ;;
+      --uninstall)
+        (( $# >= 2 )) || die "Valeur manquante pour --uninstall."
+        UNINSTALL_SELECTION="$2"
+        shift 2
+        ;;
       --root)
         (( $# >= 2 )) || die "Valeur manquante pour --root."
         SUITE_ROOT="$2"
@@ -440,6 +458,26 @@ parse_arguments() {
         ACCEPT_UNSIGNED=1
         shift
         ;;
+      --delete-rp-data)
+        DELETE_RP_DATA=1
+        shift
+        ;;
+      --delete-pulid-models)
+        DELETE_PULID_MODELS=1
+        shift
+        ;;
+      --confirm-uninstall)
+        CONFIRM_UNINSTALL=1
+        shift
+        ;;
+      --confirm-data-deletion)
+        CONFIRM_DATA_DELETION=1
+        shift
+        ;;
+      --confirm-models-deletion)
+        CONFIRM_MODELS_DELETION=1
+        shift
+        ;;
       --self-test)
         SELF_TEST=1
         shift
@@ -456,6 +494,19 @@ parse_arguments() {
     die "--channel doit valoir stable ou beta."
   [[ -z "${SELECTION}" || "${SELECTION}" == "rp-bot" || "${SELECTION}" == "pulid" || "${SELECTION}" == "both" ]] ||
     die "--select doit valoir rp-bot, pulid ou both."
+  [[ -z "${UNINSTALL_SELECTION}" || "${UNINSTALL_SELECTION}" == "rp-bot" || "${UNINSTALL_SELECTION}" == "pulid" || "${UNINSTALL_SELECTION}" == "both" ]] ||
+    die "--uninstall doit valoir rp-bot, pulid ou both."
+  [[ -z "${SELECTION}" || -z "${UNINSTALL_SELECTION}" ]] ||
+    die "--select et --uninstall sont mutuellement exclusifs."
+  if (( DELETE_RP_DATA )) && [[ "${UNINSTALL_SELECTION}" != "rp-bot" && "${UNINSTALL_SELECTION}" != "both" ]]; then
+    die "--delete-rp-data exige --uninstall rp-bot ou both."
+  fi
+  if (( DELETE_PULID_MODELS )) && [[ "${UNINSTALL_SELECTION}" != "pulid" && "${UNINSTALL_SELECTION}" != "both" ]]; then
+    die "--delete-pulid-models exige --uninstall pulid ou both."
+  fi
+  if (( (CONFIRM_UNINSTALL || CONFIRM_DATA_DELETION || CONFIRM_MODELS_DELETION) )) && [[ -z "${UNINSTALL_SELECTION}" ]]; then
+    die "Les confirmations de désinstallation exigent --uninstall."
+  fi
   [[ "${BACKGROUNDS_CHOICE}" == "yes" || "${BACKGROUNDS_CHOICE}" == "no" || "${BACKGROUNDS_CHOICE}" == "ask" ]] ||
     die "--backgrounds doit valoir yes, no ou ask."
   [[ "${SUITE_ROOT}" == /* ]] || die "--root doit être un chemin absolu."
@@ -732,13 +783,21 @@ function main(argv) {
   }
   if (action === "local-summary") {
     const local = readLocal(argv[1], argv[2], argv[3]);
+    let modelsPath = local.components.pulid ? (local.components.pulid.modelsPath || "") : "";
+    const dataSuffix = "/data/rp-bot";
+    if (modelsPath && local.paths.rpBotData.endsWith(dataSuffix)) {
+      const recordedRoot = local.paths.rpBotData.slice(0, -dataSuffix.length);
+      const recordedPrefix = recordedRoot + "/";
+      if (modelsPath.startsWith(recordedPrefix)) modelsPath = argv[2] + "/" + modelsPath.slice(recordedPrefix.length);
+    }
     return JSON.stringify({
+      updateChannel: local.updateChannel,
       rpBotVersion: local.components.rpBot ? local.components.rpBot.activeVersion : "",
       pulidVersion: local.components.pulid ? local.components.pulid.detectedVersion : "",
       pulidInstallationType: local.components.pulid ? local.components.pulid.installationType : "",
       backgroundsContentVersion: local.components.roleplayBackgrounds ? local.components.roleplayBackgrounds.activeContentVersion : "",
       backgroundsFormatVersion: local.components.roleplayBackgrounds ? local.components.roleplayBackgrounds.activeFormatVersion : "",
-      modelsPath: local.components.pulid ? (local.components.pulid.modelsPath || "") : "",
+      modelsPath: modelsPath,
       interruptedCheckpoint: local.interruptedOperation ? local.interruptedOperation.checkpoint : ""
     });
   }
@@ -763,6 +822,13 @@ function main(argv) {
       const next = { contentVersion: content, formatVersion: format, releasePath: releasePath, installedAt: now };
       const releases = upsertRelease(old ? old.releases : [], next, ["contentVersion", "formatVersion"]);
       local.components.roleplayBackgrounds = { id: "roleplay-backgrounds", installedContentVersion: content, installedFormatVersion: format, activeContentVersion: content, activeFormatVersion: format, activePath: releasePath, releases: releases };
+    } else if (update === "remove-rp") {
+      local.components.rpBot = null;
+      local.lastHealthCheck = null;
+    } else if (update === "remove-pulid") {
+      if (local.components.pulid && local.components.pulid.installationType !== "managed-local") fail("Une installation PuLID externe ou distante ne peut pas être désinstallée par la suite.");
+      local.components.pulid = null;
+      local.lastHealthCheck = null;
     } else fail("Mise à jour locale inconnue.");
     return JSON.stringify(local, null, 2);
   }
@@ -1048,6 +1114,172 @@ prompt_yes_no() {
       *) print -- "Répondez oui ou non." ;;
     esac
   done
+}
+
+assert_suite_stopped() {
+  local owner_path="${SUITE_ROOT}/state/launcher.lock/owner.json"
+  [[ -e "${SUITE_ROOT}/state/launcher.lock" ]] || return 0
+  [[ -f "${owner_path}" ]] || die "Un verrou de lancement incomplet est présent. Fermez RP Bot et PuLID, puis réessayez."
+  local manager owner_pid
+  manager="$(/usr/bin/plutil -extract manager raw -o - "${owner_path}" 2>/dev/null || true)"
+  owner_pid="$(/usr/bin/plutil -extract pid raw -o - "${owner_path}" 2>/dev/null || true)"
+  [[ "${manager}" == "rp-bot-suite-launcher" && "${owner_pid}" == <-> ]] ||
+    die "Le verrou de lancement est inconnu ; aucun processus ni binaire n'a été modifié."
+  if /bin/kill -0 "${owner_pid}" 2>/dev/null; then
+    die "RP Bot Suite est encore active (gestionnaire PID ${owner_pid}). Fermez-la avant la désinstallation."
+  fi
+}
+
+remove_managed_file() {
+  local file_path="$1" marker="$2" label="$3"
+  [[ -e "${file_path}" ]] || return 0
+  if [[ ! -f "${file_path}" ]] || ! /usr/bin/grep -Fq -- "${marker}" "${file_path}"; then
+    print -u2 -- "[AVERTISSEMENT] ${label} n'est pas géré par RP Bot et a été conservé : ${file_path}"
+    return 0
+  fi
+  /bin/rm -f -- "${file_path}" || die "Impossible de supprimer ${file_path}."
+  print -- "Supprimé : ${label} — ${file_path}"
+}
+
+remove_rp_runtime_files() {
+  local keep_pulid="$1" runtime_directory="${SUITE_ROOT}/runtimes/rp-bot-suite" file_name removed=0
+  for file_name in suite-launcher.mjs suite-updater.mjs update-request-contract.mjs safe-extract-windows.ps1; do
+    [[ ! -e "${runtime_directory}/${file_name}" ]] || removed=1
+    /bin/rm -f -- "${runtime_directory}/${file_name}" 2>/dev/null || die "Impossible de supprimer le runtime ${file_name}."
+  done
+  if (( ! keep_pulid )); then
+    for file_name in read-active-version.ps1 repair-pulid-runtime.ps1; do
+      [[ ! -e "${runtime_directory}/${file_name}" ]] || removed=1
+      /bin/rm -f -- "${runtime_directory}/${file_name}" 2>/dev/null || die "Impossible de supprimer le runtime ${file_name}."
+    done
+  fi
+  /bin/rmdir "${runtime_directory}" 2>/dev/null || true
+  (( ! removed )) || print -- "Supprimé : runtime externe RP Bot — ${runtime_directory}"
+}
+
+remove_selected_models() {
+  local models_path="$1"
+  [[ -n "${models_path}" && "${models_path}" == /* ]] || die "Le chemin de modèles PuLID enregistré n'est pas un chemin absolu sûr."
+  if [[ -L "${models_path}" ]]; then
+    die "Le dossier de modèles est un lien symbolique ; sa suppression automatique est refusée : ${models_path}"
+  fi
+  models_path="${models_path:A}"
+  [[ "${models_path}" != "/" && "${models_path}" != "${HOME:-}" && "${models_path}" != "${SUITE_ROOT:A}" ]] ||
+    die "Suppression de sécurité refusée pour le dossier de modèles : ${models_path}"
+  if [[ -e "${models_path}" ]]; then
+    safe_remove_tree "${models_path}" "${models_path:h}"
+    print -- "Supprimé : modèles PuLID — ${models_path}"
+  else
+    print -- "Déjà absent : modèles PuLID — ${models_path}"
+  fi
+}
+
+uninstall_rp_bot() {
+  local delete_data="$1" summary_path="${TEMPORARY_ROOT}/uninstall-rp-summary.json"
+  json_helper local-summary "${LOCAL_MANIFEST}" "${SUITE_ROOT}" "${CHANNEL}" > "${summary_path}" || die "Manifeste local invalide ; aucune désinstallation effectuée."
+  local current_version current_pulid_type apps_path data_path
+  current_version="$(json_get "${summary_path}" rpBotVersion || true)"
+  current_pulid_type="$(json_get "${summary_path}" pulidInstallationType || true)"
+  apps_path="${SUITE_ROOT}/apps/rp-bot"
+  data_path="${SUITE_ROOT}/data/rp-bot"
+  set_operation uninstall rp-bot installing "${current_version:--}" - "Suppression des binaires RP Bot en cours."
+  if [[ -e "${apps_path}" ]]; then
+    safe_remove_tree "${apps_path}" "${SUITE_ROOT}/apps"
+    print -- "Supprimé : binaires RP Bot — ${apps_path}"
+  else
+    print -- "Déjà absent : binaires RP Bot — ${apps_path}"
+  fi
+  remove_managed_file "${SUITE_ROOT}/${USER_LAUNCHER_NAME}" "# RP_BOT_MANAGED_LAUNCHER" "lanceur RP Bot"
+  remove_managed_file "${SUITE_ROOT}/${UPDATER_LAUNCHER_NAME}" "# RP_BOT_MANAGED_UPDATER_LAUNCHER" "lanceur de mise à jour RP Bot"
+  /bin/rm -f -- "${SUITE_ROOT}/state/update-request.json" 2>/dev/null || die "Impossible de supprimer la demande de mise à jour RP Bot."
+  remove_rp_runtime_files "$([[ "${current_pulid_type}" == "managed-local" ]] && print 1 || print 0)"
+  if (( delete_data )); then
+    if [[ -e "${data_path}" ]]; then
+      safe_remove_tree "${data_path}" "${SUITE_ROOT}/data"
+      print -- "Supprimé : données RP Bot — ${data_path}"
+    else
+      print -- "Déjà absent : données RP Bot — ${data_path}"
+    fi
+  else
+    print -- "Conservé : données RP Bot — ${data_path}"
+  fi
+  atomic_local_update remove-rp
+  atomic_local_update clear-operation
+}
+
+uninstall_pulid() {
+  local delete_models="$1" summary_path="${TEMPORARY_ROOT}/uninstall-pulid-summary.json"
+  json_helper local-summary "${LOCAL_MANIFEST}" "${SUITE_ROOT}" "${CHANNEL}" > "${summary_path}" || die "Manifeste local invalide ; aucune désinstallation effectuée."
+  local current_version current_type models_path current_rp apps_path
+  current_version="$(json_get "${summary_path}" pulidVersion || true)"
+  current_type="$(json_get "${summary_path}" pulidInstallationType || true)"
+  models_path="$(json_get "${summary_path}" modelsPath || true)"
+  current_rp="$(json_get "${summary_path}" rpBotVersion || true)"
+  [[ -z "${current_type}" || "${current_type}" == "managed-local" ]] ||
+    die "PuLID est déclaré ${current_type}. Une installation externe ou distante n'est jamais désinstallée par RP Bot Suite."
+  apps_path="${SUITE_ROOT}/apps/pulid"
+  set_operation uninstall pulid installing "${current_version:--}" - "Suppression des binaires PuLID en cours."
+  if [[ -e "${apps_path}" ]]; then
+    safe_remove_tree "${apps_path}" "${SUITE_ROOT}/apps"
+    print -- "Supprimé : binaires PuLID — ${apps_path}"
+  else
+    print -- "Déjà absent : binaires PuLID — ${apps_path}"
+  fi
+  remove_managed_file "${SUITE_ROOT}/${PULID_LOCAL_LAUNCHER_NAME}" "# RP_BOT_MANAGED_PULID_LAUNCHER" "lanceur PuLID local"
+  remove_managed_file "${SUITE_ROOT}/${PULID_NETWORK_LAUNCHER_NAME}" "# RP_BOT_MANAGED_PULID_LAUNCHER" "lanceur PuLID réseau"
+  if (( delete_models )); then
+    [[ -n "${models_path}" ]] || die "Aucun dossier de modèles PuLID géré n'est enregistré ; suppression refusée."
+    remove_selected_models "${models_path}"
+  else
+    print -- "Conservé : modèles PuLID — ${models_path:-aucun dossier géré}"
+  fi
+  atomic_local_update remove-pulid
+  atomic_local_update clear-operation
+  if [[ -z "${current_rp}" ]]; then
+    remove_rp_runtime_files 0
+  fi
+}
+
+run_uninstall() {
+  [[ -f "${LOCAL_MANIFEST}" ]] || die "Aucune installation gérée n'a été trouvée : ${LOCAL_MANIFEST}"
+  [[ "${SUITE_ROOT:A}" != "/" && "${SUITE_ROOT:A}" != "${HOME:-}" ]] ||
+    die "La racine de suite est trop large pour une désinstallation sûre : ${SUITE_ROOT}"
+  assert_suite_stopped
+  local summary_path="${TEMPORARY_ROOT}/uninstall-summary.json"
+  json_helper local-summary "${LOCAL_MANIFEST}" "${SUITE_ROOT}" "${CHANNEL}" > "${summary_path}" || die "Manifeste local invalide ; aucune désinstallation effectuée."
+  local current_rp current_pulid current_type models_path remove_rp=0 remove_pulid=0
+  CHANNEL="$(json_get "${summary_path}" updateChannel)"
+  current_rp="$(json_get "${summary_path}" rpBotVersion || true)"
+  current_pulid="$(json_get "${summary_path}" pulidVersion || true)"
+  current_type="$(json_get "${summary_path}" pulidInstallationType || true)"
+  models_path="$(json_get "${summary_path}" modelsPath || true)"
+  [[ "${UNINSTALL_SELECTION}" == "rp-bot" || "${UNINSTALL_SELECTION}" == "both" ]] && remove_rp=1
+  [[ "${UNINSTALL_SELECTION}" == "pulid" || "${UNINSTALL_SELECTION}" == "both" ]] && remove_pulid=1
+  if (( remove_pulid )) && [[ -n "${current_type}" && "${current_type}" != "managed-local" ]]; then
+    die "PuLID est déclaré ${current_type}. Une installation externe ou distante n'est jamais désinstallée par RP Bot Suite."
+  fi
+
+  notice "Désinstallation hors ligne"
+  (( remove_rp )) && print -- "  RP Bot : ${current_rp:-déjà absent}"
+  (( remove_pulid )) && print -- "  PuLID  : ${current_pulid:-déjà absent}"
+  print -- "  Les logs et le pack de décors seront conservés."
+  (( DELETE_RP_DATA )) || (( ! remove_rp )) || print -- "  Les données RP Bot seront conservées."
+  (( DELETE_PULID_MODELS )) || (( ! remove_pulid )) || print -- "  Les modèles PuLID seront conservés : ${models_path:-aucun dossier géré}"
+  if (( ! CONFIRM_UNINSTALL )); then
+    prompt_yes_no "Confirmer la désinstallation des binaires sélectionnés ?" no || die "Désinstallation annulée ; aucun fichier n'a été supprimé."
+  fi
+  if (( DELETE_RP_DATA && ! CONFIRM_DATA_DELETION )); then
+    prompt_yes_no "Confirmer séparément la suppression définitive des données RP Bot (${SUITE_ROOT}/data/rp-bot) ?" no || die "Suppression des données non confirmée ; aucun fichier n'a été supprimé."
+  fi
+  if (( DELETE_PULID_MODELS && ! CONFIRM_MODELS_DELETION )); then
+    prompt_yes_no "Confirmer séparément la suppression définitive des modèles PuLID (${models_path}) ?" no || die "Suppression des modèles non confirmée ; aucun fichier n'a été supprimé."
+  fi
+
+  (( remove_rp )) && uninstall_rp_bot "${DELETE_RP_DATA}"
+  (( remove_pulid )) && uninstall_pulid "${DELETE_PULID_MODELS}"
+  print -- "Conservé : logs — ${SUITE_ROOT}/logs"
+  print -- "Conservé : pack de décors — ${SUITE_ROOT}/assets/roleplay-backgrounds"
+  print -- "État local mis à jour atomiquement : ${LOCAL_MANIFEST}"
 }
 
 display_status() {
@@ -1427,6 +1659,48 @@ run_self_test() {
   swap_in_directory "${swap_prepared}" "${swap_target}" "${swap_parent}/unused-staging"
   rollback_swap
   [[ "$(<"${swap_target}/value")" == "old" ]] || die "Self-test rollback côte à côte en échec."
+  local repair_prepared repair_persistent
+  repair_prepared="${swap_parent}/repair-prepared"
+  repair_persistent="${swap_parent}/persistent"
+  /bin/mkdir -p "${repair_prepared}" "${repair_persistent}/data" "${repair_persistent}/models"
+  print -n -- repaired > "${repair_prepared}/value"
+  print -n -- data > "${repair_persistent}/data/preserved"
+  print -n -- model > "${repair_persistent}/models/preserved"
+  swap_in_directory "${repair_prepared}" "${swap_target}" "${swap_parent}/repair-staging"
+  commit_swap
+  [[ "$(<"${swap_target}/value")" == "repaired" && -f "${repair_persistent}/data/preserved" && -f "${repair_persistent}/models/preserved" ]] || die "Self-test réparation avec conservation des données et modèles en échec."
+  local uninstall_temporary previous_temporary_root uninstall_summary
+  uninstall_temporary="${state_base}/uninstall-temporary"
+  /bin/mkdir -p "${uninstall_temporary}" "${state_root}/data/rp-bot" "${state_root}/logs/rp-bot" "${state_root}/models/PuLID_models"
+  print -n -- data > "${state_root}/data/rp-bot/preserved"
+  print -n -- log > "${state_root}/logs/rp-bot/preserved"
+  print -n -- model > "${state_root}/models/PuLID_models/preserved"
+  previous_temporary_root="${TEMPORARY_ROOT}"
+  SUITE_ROOT="${state_root}"
+  STATE_DIRECTORY="${state_root}/state"
+  LOCAL_MANIFEST="${STATE_DIRECTORY}/installation.json"
+  TEMPORARY_ROOT="${uninstall_temporary}"
+  uninstall_rp_bot 0
+  [[ ! -e "${state_root}/apps/rp-bot" && -f "${state_root}/data/rp-bot/preserved" && -f "${state_root}/logs/rp-bot/preserved" ]] || die "Self-test désinstallation RP Bot avec conservation des données en échec."
+  uninstall_pulid 0
+  [[ ! -e "${state_root}/apps/pulid" && -f "${state_root}/models/PuLID_models/preserved" && -d "${backgrounds_path}" ]] || die "Self-test désinstallation PuLID avec conservation des modèles et décors en échec."
+  atomic_local_update activate-rp 0.2.0-beta.1 "${state_root}/apps/rp-bot/0.2.0-beta.1"
+  atomic_local_update activate-pulid 0.1.0 "${state_root}/apps/pulid/0.1.0" "${state_root}/models/PuLID_models"
+  /bin/mkdir -p "${state_root}/apps/rp-bot/0.2.0-beta.1" "${state_root}/apps/pulid/0.1.0"
+  uninstall_rp_bot 1
+  uninstall_pulid 1
+  [[ ! -e "${state_root}/data/rp-bot" && ! -e "${state_root}/models/PuLID_models" && -f "${state_root}/logs/rp-bot/preserved" && -d "${backgrounds_path}" ]] || die "Self-test suppressions persistantes explicitement confirmées en échec."
+  uninstall_summary="${uninstall_temporary}/final-summary.json"
+  json_helper local-summary "${LOCAL_MANIFEST}" "${SUITE_ROOT}" beta > "${uninstall_summary}"
+  [[ -z "$(json_get "${uninstall_summary}" rpBotVersion || true)" && -z "$(json_get "${uninstall_summary}" pulidVersion || true)" ]] || die "Self-test état atomique après désinstallation en échec."
+  print -r -- '#!/bin/zsh
+# lanceur utilisateur' > "${state_root}/${USER_LAUNCHER_NAME}"
+  remove_managed_file "${state_root}/${USER_LAUNCHER_NAME}" "# RP_BOT_MANAGED_LAUNCHER" "lanceur RP Bot"
+  [[ -f "${state_root}/${USER_LAUNCHER_NAME}" ]] || die "Self-test conservation d'un lanceur non géré en échec."
+  SUITE_ROOT="${previous_suite_root}"
+  STATE_DIRECTORY="${previous_state_directory}"
+  LOCAL_MANIFEST="${previous_local_manifest}"
+  TEMPORARY_ROOT="${previous_temporary_root}"
   /bin/rm -rf -- "${state_base}"
   print -- "Self-test installateur macOS : OK"
 }
@@ -1437,10 +1711,16 @@ main() {
     run_self_test
     return
   fi
-  TEMPORARY_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/rp-bot-installer.XXXXXX")"
+  SUITE_ROOT="${SUITE_ROOT:A}"
   STATE_DIRECTORY="${SUITE_ROOT}/state"
   DOWNLOAD_DIRECTORY="${STATE_DIRECTORY}/downloads"
   LOCAL_MANIFEST="${STATE_DIRECTORY}/installation.json"
+  TEMPORARY_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/rp-bot-installer.XXXXXX")"
+  if [[ -n "${UNINSTALL_SELECTION}" ]]; then
+    print -- "Dossier de suite : ${SUITE_ROOT}"
+    run_uninstall
+    return
+  fi
   prepare_permanent_directories
   print -- "Dossier de suite : ${SUITE_ROOT}"
 

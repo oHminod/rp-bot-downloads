@@ -18,6 +18,8 @@ param(
     [string]$Channel = "beta",
     [ValidateSet("rp-bot", "pulid", "both")]
     [string]$Select,
+    [ValidateSet("rp-bot", "pulid", "both")]
+    [string]$Uninstall,
     [string]$Root = $(
         if ([string]::IsNullOrWhiteSpace($env:_rpbot_installer_dir)) {
             Join-Path $PSScriptRoot "RP Bot Suite"
@@ -28,6 +30,11 @@ param(
     [ValidateSet("yes", "no", "ask")]
     [string]$Backgrounds = "ask",
     [switch]$AcceptUnsignedMvp,
+    [switch]$DeleteRpBotData,
+    [switch]$DeletePuLIDModels,
+    [switch]$ConfirmUninstall,
+    [switch]$ConfirmDataDeletion,
+    [switch]$ConfirmModelsDeletion,
     [switch]$SelfTest
 )
 
@@ -717,6 +724,198 @@ function Confirm-YesNo([string]$Prompt, [bool]$DefaultYes) {
     }
 }
 
+function Test-NativePathEqual([string]$Left, [string]$Right) {
+    $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $normalizedLeft = [IO.Path]::GetFullPath($Left).TrimEnd($separators)
+    $normalizedRight = [IO.Path]::GetFullPath($Right).TrimEnd($separators)
+    return [string]::Equals($normalizedLeft, $normalizedRight, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-PortableModelsPath($Local) {
+    if ($null -eq $Local.components.pulid -or [string]::IsNullOrWhiteSpace([string]$Local.components.pulid.modelsPath)) { return "" }
+    $modelsPath = [IO.Path]::GetFullPath([string]$Local.components.pulid.modelsPath)
+    $recordedDataPath = [IO.Path]::GetFullPath([string]$Local.paths.rpBotData)
+    $dataDirectory = [IO.Directory]::GetParent($recordedDataPath)
+    $candidate = if ($null -eq $dataDirectory) { $null } else { $dataDirectory.Parent }
+    if ($null -eq $candidate -or -not (Test-NativePathEqual $recordedDataPath (Join-Path $candidate.FullName "data\rp-bot"))) { return $modelsPath }
+    $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $recordedPrefix = $candidate.FullName.TrimEnd($separators) + [IO.Path]::DirectorySeparatorChar
+    if (-not $modelsPath.StartsWith($recordedPrefix, [StringComparison]::OrdinalIgnoreCase)) { return $modelsPath }
+    return (Join-Path ([IO.Path]::GetFullPath($Root)) $modelsPath.Substring($recordedPrefix.Length))
+}
+
+function Assert-SuiteStopped {
+    $lockDirectory = Join-Path $Root "state\launcher.lock"
+    if (-not (Test-Path -LiteralPath $lockDirectory)) { return }
+    $ownerPath = Join-Path $lockDirectory "owner.json"
+    if (-not (Test-Path -LiteralPath $ownerPath -PathType Leaf)) {
+        Fail "Un verrou de lancement incomplet est présent. Fermez RP Bot et PuLID, puis réessayez."
+    }
+    $owner = Read-JsonStrict $ownerPath "Verrou de lancement"
+    if ([string]$owner.manager -ne "rp-bot-suite-launcher" -or $owner.pid -isnot [ValueType] -or [int]$owner.pid -le 0) {
+        Fail "Le verrou de lancement est inconnu ; aucun processus ni binaire n'a été modifié."
+    }
+    if ($null -ne (Get-Process -Id ([int]$owner.pid) -ErrorAction SilentlyContinue)) {
+        Fail "RP Bot Suite est encore active (gestionnaire PID $($owner.pid)). Fermez-la avant la désinstallation."
+    }
+}
+
+function Remove-ManagedFile([string]$Path, [string]$Marker, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or -not [IO.File]::ReadAllText($Path).Contains($Marker)) {
+        Write-Warning "$Label n'est pas géré par RP Bot et a été conservé : $Path"
+        return
+    }
+    Remove-Item -LiteralPath $Path -Force
+    Write-Host "Supprimé : $Label — $Path"
+}
+
+function Remove-RpRuntimeFiles([bool]$KeepPuLID) {
+    $removed = $false
+    foreach ($fileName in @("suite-launcher.mjs", "suite-updater.mjs", "update-request-contract.mjs", "safe-extract-windows.ps1")) {
+        $filePath = Join-Path $script:SuiteRuntimeDirectory $fileName
+        if (Test-Path -LiteralPath $filePath) { $removed = $true; Remove-Item -LiteralPath $filePath -Force }
+    }
+    if (-not $KeepPuLID) {
+        foreach ($fileName in @($script:LauncherManifestReaderName, $script:PuLIDRuntimeRepairerName)) {
+            $filePath = Join-Path $script:SuiteRuntimeDirectory $fileName
+            if (Test-Path -LiteralPath $filePath) { $removed = $true; Remove-Item -LiteralPath $filePath -Force }
+        }
+    }
+    if (Test-Path -LiteralPath $script:SuiteRuntimeDirectory -PathType Container) {
+        $remaining = @(Get-ChildItem -LiteralPath $script:SuiteRuntimeDirectory -Force)
+        if ($remaining.Count -eq 0) { Remove-Item -LiteralPath $script:SuiteRuntimeDirectory -Force }
+    }
+    if ($removed) { Write-Host "Supprimé : runtime externe RP Bot — $($script:SuiteRuntimeDirectory)" }
+}
+
+function Remove-SelectedModels([string]$ModelsPath) {
+    if ([string]::IsNullOrWhiteSpace($ModelsPath) -or -not [IO.Path]::IsPathRooted($ModelsPath)) {
+        Fail "Le chemin de modèles PuLID enregistré n'est pas un chemin absolu sûr."
+    }
+    $fullPath = [IO.Path]::GetFullPath($ModelsPath)
+    $pathRoot = [IO.Path]::GetPathRoot($fullPath)
+    if ((Test-NativePathEqual $fullPath $pathRoot) -or
+        (Test-NativePathEqual $fullPath $Root) -or
+        (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and (Test-NativePathEqual $fullPath $env:USERPROFILE))) {
+        Fail "Suppression de sécurité refusée pour le dossier de modèles : $fullPath"
+    }
+    if (Test-Path -LiteralPath $fullPath) {
+        $item = Get-Item -LiteralPath $fullPath -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "Le dossier de modèles est un lien ou point de jonction ; sa suppression automatique est refusée : $fullPath"
+        }
+        Remove-Item -LiteralPath $fullPath -Recurse -Force
+        Write-Host "Supprimé : modèles PuLID — $fullPath"
+    }
+    else { Write-Host "Déjà absent : modèles PuLID — $fullPath" }
+}
+
+function Uninstall-RpBot([bool]$DeleteData) {
+    $local = Read-LocalManifest
+    $currentVersion = if ($null -eq $local.components.rpBot) { "" } else { [string]$local.components.rpBot.activeVersion }
+    $keepPuLID = $null -ne $local.components.pulid -and [string]$local.components.pulid.installationType -eq "managed-local"
+    Set-InterruptedOperation "uninstall" "rp-bot" "installing" $currentVersion "" "Suppression des binaires RP Bot en cours."
+    $appsPath = Join-Path $Root "apps\rp-bot"
+    if (Test-Path -LiteralPath $appsPath) {
+        Remove-Item -LiteralPath $appsPath -Recurse -Force
+        Write-Host "Supprimé : binaires RP Bot — $appsPath"
+    }
+    else { Write-Host "Déjà absent : binaires RP Bot — $appsPath" }
+    Remove-ManagedFile (Join-Path $Root $script:UserLauncherName) "rem RP_BOT_MANAGED_LAUNCHER" "lanceur RP Bot"
+    Remove-ManagedFile (Join-Path $Root $script:UpdaterLauncherName) "rem RP_BOT_MANAGED_UPDATER_LAUNCHER" "lanceur de mise à jour RP Bot"
+    $updateRequestPath = Join-Path $script:StateDirectory "update-request.json"
+    if (Test-Path -LiteralPath $updateRequestPath) { Remove-Item -LiteralPath $updateRequestPath -Force }
+    Remove-RpRuntimeFiles $keepPuLID
+    $dataPath = Join-Path $Root "data\rp-bot"
+    if ($DeleteData) {
+        if (Test-Path -LiteralPath $dataPath) {
+            Remove-Item -LiteralPath $dataPath -Recurse -Force
+            Write-Host "Supprimé : données RP Bot — $dataPath"
+        }
+        else { Write-Host "Déjà absent : données RP Bot — $dataPath" }
+    }
+    else { Write-Host "Conservé : données RP Bot — $dataPath" }
+    $local = Read-LocalManifest
+    $local.components.rpBot = $null
+    $local.lastHealthCheck = $null
+    Write-LocalManifestAtomic $local
+    Clear-InterruptedOperation
+}
+
+function Uninstall-PuLID([bool]$DeleteModels) {
+    $local = Read-LocalManifest
+    $currentType = if ($null -eq $local.components.pulid) { "" } else { [string]$local.components.pulid.installationType }
+    if ($currentType -and $currentType -ne "managed-local") {
+        Fail "PuLID est déclaré $currentType. Une installation externe ou distante n'est jamais désinstallée par RP Bot Suite."
+    }
+    $currentVersion = if ($null -eq $local.components.pulid) { "" } else { [string]$local.components.pulid.detectedVersion }
+    $modelsPath = Get-PortableModelsPath $local
+    $keepRpBot = $null -ne $local.components.rpBot
+    Set-InterruptedOperation "uninstall" "pulid" "installing" $currentVersion "" "Suppression des binaires PuLID en cours."
+    $appsPath = Join-Path $Root "apps\pulid"
+    if (Test-Path -LiteralPath $appsPath) {
+        Remove-Item -LiteralPath $appsPath -Recurse -Force
+        Write-Host "Supprimé : binaires PuLID — $appsPath"
+    }
+    else { Write-Host "Déjà absent : binaires PuLID — $appsPath" }
+    Remove-ManagedFile (Join-Path $Root $script:PuLIDLocalLauncherName) "rem RP_BOT_MANAGED_PULID_LAUNCHER" "lanceur PuLID local"
+    Remove-ManagedFile (Join-Path $Root $script:PuLIDNetworkLauncherName) "rem RP_BOT_MANAGED_PULID_LAUNCHER" "lanceur PuLID réseau"
+    $repairerPath = Join-Path $script:SuiteRuntimeDirectory $script:PuLIDRuntimeRepairerName
+    if (Test-Path -LiteralPath $repairerPath) { Remove-Item -LiteralPath $repairerPath -Force }
+    if ($DeleteModels) {
+        if ([string]::IsNullOrWhiteSpace($modelsPath)) { Fail "Aucun dossier de modèles PuLID géré n'est enregistré ; suppression refusée." }
+        Remove-SelectedModels $modelsPath
+    }
+    else { Write-Host "Conservé : modèles PuLID — $(if ($modelsPath) { $modelsPath } else { 'aucun dossier géré' })" }
+    $local = Read-LocalManifest
+    $local.components.pulid = $null
+    $local.lastHealthCheck = $null
+    Write-LocalManifestAtomic $local
+    Clear-InterruptedOperation
+    if (-not $keepRpBot) { Remove-RpRuntimeFiles $false }
+}
+
+function Invoke-Uninstall {
+    if (-not (Test-Path -LiteralPath $script:LocalManifestPath -PathType Leaf)) { Fail "Aucune installation gérée n'a été trouvée : $($script:LocalManifestPath)" }
+    $fullSuiteRoot = [IO.Path]::GetFullPath($Root)
+    $volumeRoot = [IO.Path]::GetPathRoot($fullSuiteRoot)
+    if ((Test-NativePathEqual $fullSuiteRoot $volumeRoot) -or
+        (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE) -and (Test-NativePathEqual $fullSuiteRoot $env:USERPROFILE))) {
+        Fail "La racine de suite est trop large pour une désinstallation sûre : $fullSuiteRoot"
+    }
+    Assert-SuiteStopped
+    $local = Read-LocalManifest
+    $removeRpBot = $Uninstall -in @("rp-bot", "both")
+    $removePuLID = $Uninstall -in @("pulid", "both")
+    if ($removePuLID -and $null -ne $local.components.pulid -and [string]$local.components.pulid.installationType -ne "managed-local") {
+        Fail "PuLID est déclaré $($local.components.pulid.installationType). Une installation externe ou distante n'est jamais désinstallée par RP Bot Suite."
+    }
+    $currentRp = if ($null -eq $local.components.rpBot) { "déjà absent" } else { [string]$local.components.rpBot.activeVersion }
+    $currentPuLID = if ($null -eq $local.components.pulid) { "déjà absent" } else { [string]$local.components.pulid.detectedVersion }
+    $modelsPath = if ($null -eq $local.components.pulid) { "aucun dossier géré" } else { Get-PortableModelsPath $local }
+    Write-Section "Désinstallation hors ligne"
+    if ($removeRpBot) { Write-Host "  RP Bot : $currentRp" }
+    if ($removePuLID) { Write-Host "  PuLID  : $currentPuLID" }
+    Write-Host "  Les logs et le pack de décors seront conservés."
+    if ($removeRpBot -and -not $DeleteRpBotData) { Write-Host "  Les données RP Bot seront conservées." }
+    if ($removePuLID -and -not $DeletePuLIDModels) { Write-Host "  Les modèles PuLID seront conservés : $modelsPath" }
+    if (-not $ConfirmUninstall -and -not (Confirm-YesNo "Confirmer la désinstallation des binaires sélectionnés ?" $false)) {
+        Fail "Désinstallation annulée ; aucun fichier n'a été supprimé."
+    }
+    if ($DeleteRpBotData -and -not $ConfirmDataDeletion -and -not (Confirm-YesNo "Confirmer séparément la suppression définitive des données RP Bot ($(Join-Path $Root 'data\rp-bot')) ?" $false)) {
+        Fail "Suppression des données non confirmée ; aucun fichier n'a été supprimé."
+    }
+    if ($DeletePuLIDModels -and -not $ConfirmModelsDeletion -and -not (Confirm-YesNo "Confirmer séparément la suppression définitive des modèles PuLID ($modelsPath) ?" $false)) {
+        Fail "Suppression des modèles non confirmée ; aucun fichier n'a été supprimé."
+    }
+    if ($removeRpBot) { Uninstall-RpBot ([bool]$DeleteRpBotData) }
+    if ($removePuLID) { Uninstall-PuLID ([bool]$DeletePuLIDModels) }
+    Write-Host "Conservé : logs — $(Join-Path $Root 'logs')"
+    Write-Host "Conservé : pack de décors — $(Join-Path $Root 'assets\roleplay-backgrounds')"
+    Write-Host "État local mis à jour atomiquement : $($script:LocalManifestPath)"
+}
+
 function Require-WritableDirectory([string]$Directory) {
     New-Item -ItemType Directory -Path $Directory -Force | Out-Null
     $probe = Join-Path $Directory (".rp-bot-write-test." + [Guid]::NewGuid())
@@ -1290,6 +1489,109 @@ function Invoke-SelfTest {
         if ($LASTEXITCODE -ne 0 -or $movedUpdaterOutput -notlike "*Racine : $movedRoot\*" -or $movedUpdaterOutput -notlike "*Demande : $movedRoot\state\update-request.json*") {
             Fail ("Self-test déplacement du lanceur updater Windows en échec.`r`n" + $movedUpdaterOutput)
         }
+        $repairRoot = Join-Path $selfTestRoot "repair-swap"
+        $repairTarget = Join-Path $repairRoot "target"
+        $repairPrepared = Join-Path $repairRoot "prepared"
+        $repairPersistent = Join-Path $repairRoot "persistent"
+        New-Item -ItemType Directory -Path $repairTarget, $repairPrepared, (Join-Path $repairPersistent "data"), (Join-Path $repairPersistent "models") -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $repairTarget "value"), "old")
+        [IO.File]::WriteAllText((Join-Path $repairPrepared "value"), "repaired")
+        [IO.File]::WriteAllText((Join-Path $repairPersistent "data\preserved"), "data")
+        [IO.File]::WriteAllText((Join-Path $repairPersistent "models\preserved"), "model")
+        Start-DirectorySwap $repairPrepared $repairTarget (Join-Path $repairRoot "staging")
+        Complete-DirectorySwap
+        if ([IO.File]::ReadAllText((Join-Path $repairTarget "value")) -ne "repaired" -or
+            -not (Test-Path -LiteralPath (Join-Path $repairPersistent "data\preserved")) -or
+            -not (Test-Path -LiteralPath (Join-Path $repairPersistent "models\preserved"))) {
+            Fail "Self-test réparation avec conservation des données et modèles en échec."
+        }
+        $previousRoot = $script:Root
+        $previousSuiteRuntimeDirectory = $script:SuiteRuntimeDirectory
+        $uninstallRoot = Join-Path $selfTestBase "RP Bot Suite uninstall"
+        try {
+            $script:Root = $uninstallRoot
+            $script:StateDirectory = Join-Path $uninstallRoot "state"
+            $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
+            $script:SuiteRuntimeDirectory = Join-Path $uninstallRoot "runtimes\rp-bot-suite"
+            $uninstallModels = Join-Path $uninstallRoot "models\PuLID_models"
+            $uninstallData = Join-Path $uninstallRoot "data\rp-bot"
+            $uninstallLogs = Join-Path $uninstallRoot "logs\rp-bot"
+            $uninstallBackgrounds = Join-Path $uninstallRoot "assets\roleplay-backgrounds\1.0.0-format-1.0.0"
+            foreach ($directory in @(
+                (Join-Path $uninstallRoot "apps\rp-bot\0.2.0-beta.1"),
+                (Join-Path $uninstallRoot "apps\pulid\0.1.0"),
+                $uninstallModels, $uninstallData, $uninstallLogs, $uninstallBackgrounds,
+                $script:StateDirectory, $script:SuiteRuntimeDirectory
+            )) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+            [IO.File]::WriteAllText((Join-Path $uninstallModels "preserved"), "model")
+            [IO.File]::WriteAllText((Join-Path $uninstallData "preserved"), "data")
+            [IO.File]::WriteAllText((Join-Path $uninstallLogs "preserved"), "log")
+            [IO.File]::WriteAllText((Join-Path $uninstallBackgrounds "preserved"), "background")
+            $uninstallManifest = [pscustomobject]@{
+                schemaVersion = 1; suiteId = "rp-bot-suite"; updateChannel = "beta"
+                components = [pscustomobject]@{
+                    rpBot = [pscustomobject]@{
+                        id = "rp-bot"; installedVersion = "0.2.0-beta.1"; activeVersion = "0.2.0-beta.1"
+                        releases = @([pscustomobject]@{ version = "0.2.0-beta.1"; releasePath = (Join-Path $uninstallRoot "apps\rp-bot\0.2.0-beta.1"); installedAt = "2026-08-31T00:00:00.000Z" })
+                    }
+                    pulid = [pscustomobject]@{
+                        id = "pulid"; installationType = "managed-local"; detectedVersion = "0.1.0"; endpoint = "http://127.0.0.1:12693"; modelsPath = $uninstallModels
+                        managedInstallation = [pscustomobject]@{
+                            id = "pulid"; installedVersion = "0.1.0"; activeVersion = "0.1.0"
+                            releases = @([pscustomobject]@{ version = "0.1.0"; releasePath = (Join-Path $uninstallRoot "apps\pulid\0.1.0"); installedAt = "2026-08-31T00:00:00.000Z" })
+                        }
+                    }
+                    roleplayBackgrounds = [pscustomobject]@{
+                        id = "roleplay-backgrounds"; installedContentVersion = "1.0.0"; installedFormatVersion = "1.0.0"; activeContentVersion = "1.0.0"; activeFormatVersion = "1.0.0"; activePath = $uninstallBackgrounds
+                        releases = @([pscustomobject]@{ contentVersion = "1.0.0"; formatVersion = "1.0.0"; releasePath = $uninstallBackgrounds; installedAt = "2026-08-31T00:00:00.000Z" })
+                    }
+                }
+                paths = [pscustomobject]@{ rpBotData = $uninstallData }
+                lastHealthCheck = $null; interruptedOperation = $null
+            }
+            Write-LocalManifestAtomic $uninstallManifest
+            [IO.File]::WriteAllText((Join-Path $uninstallRoot $script:UserLauncherName), "@echo off`r`nrem RP_BOT_MANAGED_LAUNCHER`r`n")
+            [IO.File]::WriteAllText((Join-Path $uninstallRoot $script:UpdaterLauncherName), "@echo off`r`nrem RP_BOT_MANAGED_UPDATER_LAUNCHER`r`n")
+            [IO.File]::WriteAllText((Join-Path $uninstallRoot $script:PuLIDLocalLauncherName), "@echo off`r`nrem RP_BOT_MANAGED_PULID_LAUNCHER`r`n")
+            [IO.File]::WriteAllText((Join-Path $uninstallRoot $script:PuLIDNetworkLauncherName), "@echo off`r`nrem RP_BOT_MANAGED_PULID_LAUNCHER`r`n")
+            Uninstall-RpBot $false
+            $afterRpUninstall = Read-LocalManifest
+            if ($null -ne $afterRpUninstall.components.rpBot -or
+                (Test-Path -LiteralPath (Join-Path $uninstallRoot "apps\rp-bot")) -or
+                -not (Test-Path -LiteralPath (Join-Path $uninstallData "preserved")) -or
+                -not (Test-Path -LiteralPath (Join-Path $uninstallLogs "preserved"))) {
+                Fail "Self-test désinstallation RP Bot avec conservation des données en échec."
+            }
+            Uninstall-PuLID $false
+            $afterPuLIDUninstall = Read-LocalManifest
+            if ($null -ne $afterPuLIDUninstall.components.pulid -or
+                (Test-Path -LiteralPath (Join-Path $uninstallRoot "apps\pulid")) -or
+                -not (Test-Path -LiteralPath (Join-Path $uninstallModels "preserved")) -or
+                -not (Test-Path -LiteralPath (Join-Path $uninstallBackgrounds "preserved"))) {
+                Fail "Self-test désinstallation PuLID avec conservation des modèles et décors en échec."
+            }
+            Activate-RpBot "0.2.0-beta.1" (Join-Path $uninstallRoot "apps\rp-bot\0.2.0-beta.1")
+            Activate-PuLID "0.1.0" (Join-Path $uninstallRoot "apps\pulid\0.1.0") $uninstallModels
+            New-Item -ItemType Directory -Path (Join-Path $uninstallRoot "apps\rp-bot\0.2.0-beta.1") -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $uninstallRoot "apps\pulid\0.1.0") -Force | Out-Null
+            Uninstall-RpBot $true
+            Uninstall-PuLID $true
+            if ((Test-Path -LiteralPath $uninstallData) -or (Test-Path -LiteralPath $uninstallModels) -or
+                -not (Test-Path -LiteralPath (Join-Path $uninstallLogs "preserved")) -or
+                -not (Test-Path -LiteralPath (Join-Path $uninstallBackgrounds "preserved"))) {
+                Fail "Self-test suppressions persistantes explicitement confirmées en échec."
+            }
+            $unownedLauncher = Join-Path $uninstallRoot $script:UserLauncherName
+            [IO.File]::WriteAllText($unownedLauncher, "@echo off`r`nrem lanceur utilisateur`r`n")
+            Remove-ManagedFile $unownedLauncher "rem RP_BOT_MANAGED_LAUNCHER" "lanceur RP Bot"
+            if (-not (Test-Path -LiteralPath $unownedLauncher -PathType Leaf)) { Fail "Self-test conservation d'un lanceur non géré en échec." }
+        }
+        finally {
+            $script:Root = $previousRoot
+            $script:SuiteRuntimeDirectory = $previousSuiteRuntimeDirectory
+            $script:StateDirectory = Join-Path $selfTestRoot "state"
+            $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
+        }
     } finally {
         $script:StateDirectory = $previousStateDirectory
         $script:LocalManifestPath = $previousLocalManifestPath
@@ -1301,6 +1603,17 @@ function Invoke-SelfTest {
 function Main {
     if ($SelfTest) { Invoke-SelfTest; return }
     if (-not [IO.Path]::IsPathRooted($Root)) { Fail "-Root doit être un chemin absolu." }
+    if ($Select -and $Uninstall) { Fail "-Select et -Uninstall sont mutuellement exclusifs." }
+    if ($DeleteRpBotData -and $Uninstall -notin @("rp-bot", "both")) { Fail "-DeleteRpBotData exige -Uninstall rp-bot ou both." }
+    if ($DeletePuLIDModels -and $Uninstall -notin @("pulid", "both")) { Fail "-DeletePuLIDModels exige -Uninstall pulid ou both." }
+    if (($ConfirmUninstall -or $ConfirmDataDeletion -or $ConfirmModelsDeletion) -and -not $Uninstall) {
+        Fail "Les confirmations de désinstallation exigent -Uninstall."
+    }
+    if ($Uninstall) {
+        Write-Host "Dossier de suite : $Root"
+        Invoke-Uninstall
+        return
+    }
     $script:TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("rp-bot-installer." + [Guid]::NewGuid())
     New-Item -ItemType Directory -Path $script:TemporaryRoot -Force | Out-Null
     Initialize-PermanentDirectories
@@ -1342,7 +1655,7 @@ function Main {
         elseif ($Backgrounds -eq "yes" -or ($Backgrounds -eq "ask" -and (Confirm-YesNo "Installer le pack de décors recommandé ($((Get-Artifact $manifest 'roleplay-backgrounds').sizeBytes) octets) ?" $true))) { $installBackgrounds = $true }
     }
     if ($installPulid) {
-        if (-not $ModelsRoot -and $null -ne $local.components.pulid) { $script:ModelsRoot = [string]$local.components.pulid.modelsPath }
+        if (-not $ModelsRoot -and $null -ne $local.components.pulid) { $script:ModelsRoot = Get-PortableModelsPath $local }
         if (-not $ModelsRoot) {
             $defaultModels = Join-Path $Root "models\PuLID_models"
             if (Confirm-YesNo "Utiliser $defaultModels pour les modèles PuLID ?" $true) { $script:ModelsRoot = $defaultModels }
