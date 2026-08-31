@@ -43,6 +43,8 @@ LOCAL_MANIFEST=""
 STATE_DIRECTORY=""
 DOWNLOAD_DIRECTORY=""
 MANIFEST_PATH=""
+SDXL_MODE="skip"
+SDXL_STAGED_CHECKPOINT=""
 
 die() {
   print -u2 -- "[ERREUR] $*"
@@ -1116,6 +1118,65 @@ prompt_yes_no() {
   done
 }
 
+collect_sdxl_choices() {
+  local checkpoints_directory="${MODELS_ROOT}/checkpoints"
+  local staging_directory="${TEMPORARY_ROOT}/sdxl-checkpoint"
+  local -a checkpoints staged_checkpoints
+  checkpoints=("${checkpoints_directory}"/*.safetensors(N.))
+  if (( ${#checkpoints[@]} > 0 )); then
+    SDXL_MODE="ask"
+    print -- "Checkpoint SDXL existant détecté : ${checkpoints[1]}"
+    return
+  fi
+  if ! prompt_yes_no "Souhaitez-vous installer un modèle SDXL maintenant ?" yes; then
+    SDXL_MODE="skip"
+    return
+  fi
+  if ! prompt_yes_no "Avez-vous déjà un modèle SDXL au format .safetensors ?" no; then
+    if prompt_yes_no "Télécharger le modèle officiel Stable Diffusion XL Base 1.0 (~6,9 Go) ?" yes; then
+      SDXL_MODE="download"
+    else
+      SDXL_MODE="skip"
+    fi
+    return
+  fi
+
+  /bin/mkdir -p "${staging_directory}" || die "Impossible de créer le dossier temporaire SDXL."
+  print -- "\nCopiez un seul checkpoint SDXL .safetensors dans ce dossier temporaire :"
+  print -- "  ${staging_directory}"
+  print -- "Placez-y une copie : ce dossier temporaire sera supprimé à la fin de l'installeur."
+  while true; do
+    read -r "REPLY?Appuyez sur Entrée lorsque la copie est terminée : "
+    staged_checkpoints=("${staging_directory}"/*.safetensors(N.))
+    if (( ${#staged_checkpoints[@]} == 1 )); then
+      SDXL_MODE="ask"
+      SDXL_STAGED_CHECKPOINT="${staged_checkpoints[1]}"
+      return
+    fi
+    print -- "Un seul fichier .safetensors est attendu dans ${staging_directory} ; ${#staged_checkpoints[@]} détecté(s)."
+  done
+}
+
+install_staged_sdxl_checkpoint() {
+  [[ -n "${SDXL_STAGED_CHECKPOINT}" ]] || return
+  local checkpoints_directory="${MODELS_ROOT}/checkpoints"
+  local destination="${checkpoints_directory}/${SDXL_STAGED_CHECKPOINT:t}"
+  local temporary_destination="${destination}.$$.tmp"
+  /bin/mkdir -p "${checkpoints_directory}" || die "Impossible de préparer le dossier de checkpoints SDXL."
+  [[ ! -e "${destination}" ]] || die "Un checkpoint SDXL porte déjà ce nom : ${destination}"
+  if ! /bin/cp -- "${SDXL_STAGED_CHECKPOINT}" "${temporary_destination}"; then
+    /bin/rm -f -- "${temporary_destination}" 2>/dev/null || true
+    die "Impossible de copier le checkpoint SDXL vers ${checkpoints_directory}."
+  fi
+  /bin/chmod 600 "${temporary_destination}"
+  /bin/mv -- "${temporary_destination}" "${destination}" || {
+    /bin/rm -f -- "${temporary_destination}" 2>/dev/null || true
+    die "Impossible d'activer le checkpoint SDXL ${destination}."
+  }
+  SDXL_STAGED_CHECKPOINT=""
+  print -- "Checkpoint SDXL copié : ${destination}"
+}
+
 assert_suite_stopped() {
   local owner_path="${SUITE_ROOT}/state/launcher.lock/owner.json"
   [[ -e "${SUITE_ROOT}/state/launcher.lock" ]] || return 0
@@ -1423,7 +1484,7 @@ install_rp_bot() {
 }
 
 create_pulid_bash32_compat_installer() {
-  local release_root="$1" source_path compat_path line replacements=0
+  local release_root="$1" source_path compat_path line array_replacements=0 prompt_replacements=0
   source_path="${release_root}/install_macos.sh"
   compat_path="${release_root}/.rp-bot-install-macos-compat.sh"
   [[ -f "${source_path}" ]] || die "Installateur macOS PuLID absent."
@@ -1431,14 +1492,18 @@ create_pulid_bash32_compat_installer() {
   while IFS= read -r line || [[ -n "${line}" ]]; do
     if [[ "${line}" == '  "${PULID_EDITABLE_ARGS[@]}" \' ]]; then
       print -r -- '  ${PULID_EDITABLE_ARGS[@]+"${PULID_EDITABLE_ARGS[@]}"} \' >> "${compat_path}"
-      replacements=$(( replacements + 1 ))
+      array_replacements=$(( array_replacements + 1 ))
+    elif [[ "${line}" == '  --sdxl ask' ]]; then
+      print -r -- '  --sdxl "${PULID_SDXL_MODE:?Mode SDXL non configuré}" \' >> "${compat_path}"
+      print -r -- '  --accept-insightface-license' >> "${compat_path}"
+      prompt_replacements=$(( prompt_replacements + 1 ))
     else
       print -r -- "${line}" >> "${compat_path}"
     fi
   done < "${source_path}"
-  if (( replacements != 1 )); then
+  if (( array_replacements != 1 || prompt_replacements != 1 )); then
     /bin/rm -f -- "${compat_path}"
-    die "Le correctif de compatibilité Bash 3.2 ne correspond pas exactement à l'installateur PuLID attendu ; aucune exécution effectuée."
+    die "L'adaptateur non interactif Bash 3.2 ne correspond pas exactement à l'installateur PuLID attendu ; aucune exécution effectuée."
   fi
   /bin/chmod 700 "${compat_path}" || die "Impossible de rendre exécutable l'installateur PuLID temporaire."
   REPLY="${compat_path}"
@@ -1468,7 +1533,7 @@ install_pulid() {
   swap_in_directory "${prepared}" "${target}" "${staging}"
   create_pulid_bash32_compat_installer "${target}"
   compat_installer="${REPLY}"
-  if ! PULID_MODELS_ROOT="${MODELS_ROOT}" "${compat_installer}" --production; then
+  if ! PULID_MODELS_ROOT="${MODELS_ROOT}" PULID_SDXL_MODE="${SDXL_MODE}" "${compat_installer}" --production </dev/null; then
     /bin/rm -f -- "${compat_installer}"
     rollback_swap
     die "L'installation PuLID a échoué. Les modèles déjà valides ont été conservés dans ${MODELS_ROOT}."
@@ -1634,21 +1699,45 @@ run_self_test() {
     print -r -- 'set -u'
     print -r -- 'PULID_EDITABLE_ARGS=()'
     print -r -- 'if [[ "${1:-}" == "--development" ]]; then PULID_EDITABLE_ARGS=(-e); fi'
+    print -r -- 'compat_args() {'
     print -r -- 'printf "%s\n" "compat-ok" \'
     print -r -- '  "${PULID_EDITABLE_ARGS[@]}" \'
-    print -r -- '  > "${BASH_SOURCE[0]}.output"'
+    print -r -- '  --sdxl ask'
+    print -r -- '}'
+    print -r -- 'compat_args > "${BASH_SOURCE[0]}.output"'
   } > "${compat_source}"
   compat_source_sha="$(file_sha256 "${compat_source}")"
   create_pulid_bash32_compat_installer "${compat_root}"
   compat_installer="${REPLY}"
   [[ "$(file_sha256 "${compat_source}")" == "${compat_source_sha}" ]] || die "Self-test intégrité de l'installateur PuLID original en échec."
-  /bin/bash "${compat_installer}"
+  PULID_SDXL_MODE=skip /bin/bash "${compat_installer}"
   compat_output="$(<"${compat_installer}.output")"
-  [[ "${compat_output}" == "compat-ok" ]] || die "Self-test compatibilité Bash 3.2 PuLID production en échec."
-  /bin/bash "${compat_installer}" --development
+  [[ "${compat_output}" == $'compat-ok\n--sdxl\nskip\n--accept-insightface-license' ]] || die "Self-test compatibilité Bash 3.2 PuLID production en échec."
+  PULID_SDXL_MODE=download /bin/bash "${compat_installer}" --development
   compat_output="$(<"${compat_installer}.output")"
-  [[ "${compat_output}" == $'compat-ok\n-e' ]] || die "Self-test compatibilité Bash 3.2 PuLID développement en échec."
+  [[ "${compat_output}" == $'compat-ok\n-e\n--sdxl\ndownload\n--accept-insightface-license' ]] || die "Self-test compatibilité Bash 3.2 PuLID développement en échec."
   /bin/rm -f -- "${compat_installer}" "${compat_installer}.output"
+  local previous_models_root previous_sdxl_mode previous_staged_checkpoint existing_models_root staged_models_root staged_checkpoint
+  previous_models_root="${MODELS_ROOT}"
+  previous_sdxl_mode="${SDXL_MODE}"
+  previous_staged_checkpoint="${SDXL_STAGED_CHECKPOINT}"
+  existing_models_root="${state_root}/sdxl-existing/PuLID_models"
+  /bin/mkdir -p "${existing_models_root}/checkpoints"
+  print -n -- existing > "${existing_models_root}/checkpoints/existing.safetensors"
+  MODELS_ROOT="${existing_models_root}"
+  SDXL_MODE="skip"
+  collect_sdxl_choices
+  [[ "${SDXL_MODE}" == "ask" ]] || die "Self-test détection du checkpoint SDXL existant en échec."
+  staged_models_root="${state_root}/sdxl-staged/PuLID_models"
+  staged_checkpoint="${state_root}/custom.safetensors"
+  print -n -- custom > "${staged_checkpoint}"
+  MODELS_ROOT="${staged_models_root}"
+  SDXL_STAGED_CHECKPOINT="${staged_checkpoint}"
+  install_staged_sdxl_checkpoint
+  [[ -f "${staged_models_root}/checkpoints/custom.safetensors" && -f "${staged_checkpoint}" ]] || die "Self-test copie temporaire du checkpoint SDXL en échec."
+  MODELS_ROOT="${previous_models_root}"
+  SDXL_MODE="${previous_sdxl_mode}"
+  SDXL_STAGED_CHECKPOINT="${previous_staged_checkpoint}"
   local swap_parent swap_target swap_prepared
   swap_parent="${state_root}/swap"
   swap_target="${swap_parent}/target"
@@ -1795,6 +1884,7 @@ main() {
     print -- "\nLicence InsightFace/AntelopeV2 : les poids sont réservés à la recherche non commerciale."
     print -- "Conditions : https://github.com/deepinsight/insightface/blob/master/server/LICENSING.md"
     prompt_yes_no "Acceptez-vous explicitement ces conditions avant tout téléchargement de modèle ?" no || die "Licence InsightFace refusée ; PuLID n'a pas été installé."
+    collect_sdxl_choices
   fi
 
   local unsigned_lines
@@ -1808,12 +1898,16 @@ main() {
     fi
   fi
 
+  notice "Configuration terminée — l'installation se poursuit sans autre question"
   notice "Préflight matériel, disque, ports et réseau"
   prepare_preflight "${suite_summary}" "${install_rp}" "${install_pulid}" "${install_backgrounds}"
 
   (( install_rp )) && install_rp_bot "${suite_summary}" "${current_rp}"
-  (( install_pulid )) && install_pulid "${suite_summary}" "${current_pulid}"
   (( install_backgrounds )) && install_backgrounds "${suite_summary}"
+  if (( install_pulid )); then
+    install_staged_sdxl_checkpoint
+    install_pulid "${suite_summary}" "${current_pulid}"
+  fi
 
   local installed_rp
   installed_rp="$(json_helper local-summary "${LOCAL_MANIFEST}" "${SUITE_ROOT}" "${CHANNEL}" | /usr/bin/plutil -extract rpBotVersion raw -o - -)"

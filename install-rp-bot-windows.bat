@@ -62,6 +62,8 @@ $script:DownloadDirectory = Join-Path $script:StateDirectory "downloads"
 $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
 $script:TemporaryRoot = $null
 $script:Swap = $null
+$script:SdxlMode = "skip"
+$script:StagedSdxlCheckpoint = $null
 
 function Fail([string]$Message) {
     throw $Message
@@ -724,6 +726,63 @@ function Confirm-YesNo([string]$Prompt, [bool]$DefaultYes) {
     }
 }
 
+function Get-SdxlCheckpoints([string]$Directory) {
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return @() }
+    return @(Get-ChildItem -LiteralPath $Directory -File -Filter "*.safetensors" -ErrorAction Stop | Sort-Object Name)
+}
+
+function Read-SdxlChoices {
+    $checkpointsDirectory = Join-Path $ModelsRoot "checkpoints"
+    $checkpoints = @(Get-SdxlCheckpoints $checkpointsDirectory)
+    if ($checkpoints.Count -gt 0) {
+        $script:SdxlMode = "ask"
+        Write-Host "Checkpoint SDXL existant détecté : $($checkpoints[0].FullName)"
+        return
+    }
+    if (-not (Confirm-YesNo "Souhaitez-vous installer un modèle SDXL maintenant ?" $true)) {
+        $script:SdxlMode = "skip"
+        return
+    }
+    if (-not (Confirm-YesNo "Avez-vous déjà un modèle SDXL au format .safetensors ?" $false)) {
+        $script:SdxlMode = if (Confirm-YesNo "Télécharger le modèle officiel Stable Diffusion XL Base 1.0 (~6,9 Go) ?" $true) { "download" } else { "skip" }
+        return
+    }
+
+    $stagingDirectory = Join-Path $script:TemporaryRoot "sdxl-checkpoint"
+    New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
+    Write-Host ""
+    Write-Host "Copiez un seul checkpoint SDXL .safetensors dans ce dossier temporaire :"
+    Write-Host "  $stagingDirectory"
+    Write-Host "Placez-y une copie : ce dossier temporaire sera supprimé à la fin de l'installeur."
+    while ($true) {
+        Read-Host "Appuyez sur Entrée lorsque la copie est terminée" | Out-Null
+        $stagedCheckpoints = @(Get-SdxlCheckpoints $stagingDirectory)
+        if ($stagedCheckpoints.Count -eq 1) {
+            $script:SdxlMode = "ask"
+            $script:StagedSdxlCheckpoint = $stagedCheckpoints[0].FullName
+            return
+        }
+        Write-Host "Un seul fichier .safetensors est attendu dans $stagingDirectory ; $($stagedCheckpoints.Count) détecté(s)."
+    }
+}
+
+function Install-StagedSdxlCheckpoint {
+    if ([string]::IsNullOrWhiteSpace([string]$script:StagedSdxlCheckpoint)) { return }
+    $checkpointsDirectory = Join-Path $ModelsRoot "checkpoints"
+    New-Item -ItemType Directory -Path $checkpointsDirectory -Force | Out-Null
+    $fileName = [IO.Path]::GetFileName([string]$script:StagedSdxlCheckpoint)
+    $destination = Join-Path $checkpointsDirectory $fileName
+    if (Test-Path -LiteralPath $destination) { Fail "Un checkpoint SDXL porte déjà ce nom : $destination" }
+    $temporaryDestination = Join-Path $checkpointsDirectory (".{0}.{1}.tmp" -f $fileName, [Guid]::NewGuid())
+    try {
+        Copy-Item -LiteralPath $script:StagedSdxlCheckpoint -Destination $temporaryDestination
+        Move-Item -LiteralPath $temporaryDestination -Destination $destination
+    }
+    finally { Remove-Item -LiteralPath $temporaryDestination -Force -ErrorAction SilentlyContinue }
+    $script:StagedSdxlCheckpoint = $null
+    Write-Host "Checkpoint SDXL copié : $destination"
+}
+
 function Test-NativePathEqual([string]$Left, [string]$Right) {
     $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
     $normalizedLeft = [IO.Path]::GetFullPath($Left).TrimEnd($separators)
@@ -1046,6 +1105,38 @@ function Install-RpBot($Manifest, [string]$CurrentVersion) {
     Write-Host "RP Bot $version installé et activé sans modifier les données utilisateur."
 }
 
+function New-PuLIDWindowsCompatInstaller([string]$ReleaseRoot) {
+    $sourcePath = Join-Path $ReleaseRoot "install_windows.bat"
+    $compatPath = Join-Path $ReleaseRoot ".rp-bot-install-windows-compat.bat"
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { Fail "Installateur Windows PuLID absent." }
+    $expected = '"%PROJECT_DIR%.venv\Scripts\pulid-install.exe" --models-root "%PULID_MODELS_ROOT%" --sdxl ask'
+    $replacement = '"%PROJECT_DIR%.venv\Scripts\pulid-install.exe" --models-root "%PULID_MODELS_ROOT%" --sdxl "%PULID_SDXL_MODE%" --accept-insightface-license'
+    $contents = [IO.File]::ReadAllText($sourcePath)
+    $first = $contents.IndexOf($expected, [StringComparison]::Ordinal)
+    $last = $contents.LastIndexOf($expected, [StringComparison]::Ordinal)
+    if ($first -lt 0 -or $first -ne $last) { Fail "L'adaptateur non interactif Windows ne correspond pas exactement à l'installateur PuLID attendu ; aucune exécution effectuée." }
+    $updated = $contents.Substring(0, $first) + $replacement + $contents.Substring($first + $expected.Length)
+    [IO.File]::WriteAllText($compatPath, $updated, (New-Object Text.UTF8Encoding($false)))
+    return $compatPath
+}
+
+function Invoke-CmdWithoutInput([string]$BatchPath) {
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = Join-Path $env:SystemRoot "System32\cmd.exe"
+    $startInfo.Arguments = '/d /s /c ""' + $BatchPath.Replace('"', '""') + '""'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { Fail "Impossible de lancer l'installateur PuLID." }
+        $process.StandardInput.Close()
+        $process.WaitForExit()
+        return $process.ExitCode
+    }
+    finally { $process.Dispose() }
+}
+
 function Install-PuLID($Manifest, [string]$CurrentVersion) {
     $version = $Manifest.pulid.compatibleVersion; $artifact = Get-Artifact $Manifest "pulid"; $kind = if (-not $CurrentVersion) { "install" } elseif ($CurrentVersion -eq $version) { "repair" } else { "update" }
     Set-InterruptedOperation $kind "pulid" "downloading" $CurrentVersion $version "Téléchargement PuLID en cours."
@@ -1056,13 +1147,24 @@ function Install-PuLID($Manifest, [string]$CurrentVersion) {
     foreach ($required in @("pyproject.toml", "install_production_windows.bat", "install_windows.bat", "start_windows.bat")) { if (-not (Test-Path -LiteralPath (Join-Path $prepared $required) -PathType Leaf)) { Fail "Archive PuLID incomplète : $required" } }
     $target = Join-Path $Root "apps\pulid\$version"; Start-DirectorySwap $prepared $target $staging
     $previousModels = $env:PULID_MODELS_ROOT
+    $previousSdxlMode = $env:PULID_SDXL_MODE
+    $previousInstallProfile = $env:PULID_INSTALL_PROFILE
+    $compatInstaller = $null
     try {
         $env:PULID_MODELS_ROOT = $ModelsRoot
-        & "$env:SystemRoot\System32\cmd.exe" /d /c (Join-Path $target "install_production_windows.bat")
-        if ($LASTEXITCODE -ne 0) { Fail "L'installateur production PuLID a échoué." }
+        $env:PULID_SDXL_MODE = $script:SdxlMode
+        $env:PULID_INSTALL_PROFILE = "production"
+        $compatInstaller = New-PuLIDWindowsCompatInstaller $target
+        $exitCode = Invoke-CmdWithoutInput $compatInstaller
+        if ($exitCode -ne 0) { Fail "L'installateur production PuLID a échoué." }
         if (-not (Test-Path -LiteralPath (Join-Path $target ".venv\Scripts\pulid-gen.exe") -PathType Leaf)) { Fail "Le contrôle de santé PuLID n'a pas produit le runtime attendu." }
     } catch { Undo-DirectorySwap; throw }
-    finally { $env:PULID_MODELS_ROOT = $previousModels }
+    finally {
+        if ($compatInstaller) { Remove-Item -LiteralPath $compatInstaller -Force -ErrorAction SilentlyContinue }
+        $env:PULID_MODELS_ROOT = $previousModels
+        $env:PULID_SDXL_MODE = $previousSdxlMode
+        $env:PULID_INSTALL_PROFILE = $previousInstallProfile
+    }
     Activate-PuLID $version $target $ModelsRoot; Complete-DirectorySwap; Clear-InterruptedOperation
     Write-Host "PuLID $version installé avec Python privé ; modèles conservés dans $ModelsRoot."
 }
@@ -1339,6 +1441,44 @@ function Invoke-SelfTest {
     $previousStateDirectory = $script:StateDirectory
     $previousLocalManifestPath = $script:LocalManifestPath
     try {
+        $compatRoot = Join-Path $selfTestBase "pulid-compat"
+        New-Item -ItemType Directory -Path $compatRoot -Force | Out-Null
+        $compatSource = Join-Path $compatRoot "install_windows.bat"
+        $compatSourceContents = "@echo off`r`nset `"PROJECT_DIR=%~dp0`"`r`n`"%PROJECT_DIR%.venv\Scripts\pulid-install.exe`" --models-root `"%PULID_MODELS_ROOT%`" --sdxl ask`r`n"
+        [IO.File]::WriteAllText($compatSource, $compatSourceContents, (New-Object Text.UTF8Encoding($false)))
+        $compatInstaller = New-PuLIDWindowsCompatInstaller $compatRoot
+        $compatContents = [IO.File]::ReadAllText($compatInstaller)
+        if ([IO.File]::ReadAllText($compatSource) -ne $compatSourceContents -or
+            -not $compatContents.Contains('--sdxl "%PULID_SDXL_MODE%" --accept-insightface-license')) {
+            Fail "Self-test adaptateur non interactif PuLID Windows en échec."
+        }
+        $noInputFixture = Join-Path $compatRoot "no-input.bat"
+        [IO.File]::WriteAllText($noInputFixture, "@echo off`r`nset answer=`r`nset /p answer=Question interdite : `r`nif defined answer exit /b 1`r`nexit /b 0`r`n", (New-Object Text.UTF8Encoding($false)))
+        if ((Invoke-CmdWithoutInput $noInputFixture) -ne 0) { Fail "Self-test fermeture de l'entrée PuLID Windows en échec." }
+        $previousModelsRoot = $ModelsRoot
+        $previousSdxlMode = $script:SdxlMode
+        $previousStagedCheckpoint = $script:StagedSdxlCheckpoint
+        $existingModelsRoot = Join-Path $selfTestRoot "sdxl-existing\PuLID_models"
+        $existingCheckpoints = Join-Path $existingModelsRoot "checkpoints"
+        New-Item -ItemType Directory -Path $existingCheckpoints -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $existingCheckpoints "existing.safetensors"), "existing")
+        $script:ModelsRoot = $existingModelsRoot
+        $script:SdxlMode = "skip"
+        Read-SdxlChoices
+        if ($script:SdxlMode -ne "ask") { Fail "Self-test détection du checkpoint SDXL existant en échec." }
+        $stagedModelsRoot = Join-Path $selfTestRoot "sdxl-staged\PuLID_models"
+        $stagedCheckpoint = Join-Path $selfTestRoot "custom.safetensors"
+        [IO.File]::WriteAllText($stagedCheckpoint, "custom")
+        $script:ModelsRoot = $stagedModelsRoot
+        $script:StagedSdxlCheckpoint = $stagedCheckpoint
+        Install-StagedSdxlCheckpoint
+        if (-not (Test-Path -LiteralPath (Join-Path $stagedModelsRoot "checkpoints\custom.safetensors") -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $stagedCheckpoint -PathType Leaf)) {
+            Fail "Self-test copie temporaire du checkpoint SDXL en échec."
+        }
+        $script:ModelsRoot = $previousModelsRoot
+        $script:SdxlMode = $previousSdxlMode
+        $script:StagedSdxlCheckpoint = $previousStagedCheckpoint
         $script:StateDirectory = Join-Path $selfTestRoot "state"
         $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
         Write-LocalManifestAtomic ([pscustomobject]@{ marker = "first" })
@@ -1665,6 +1805,7 @@ function Main {
         Write-Host ""; Write-Host "Licence InsightFace/AntelopeV2 : poids réservés à la recherche non commerciale."
         Write-Host "https://github.com/deepinsight/insightface/blob/master/server/LICENSING.md"
         if (-not (Confirm-YesNo "Acceptez-vous explicitement ces conditions avant tout téléchargement de modèle ?" $false)) { Fail "Licence InsightFace refusée ; PuLID n'a pas été installé." }
+        Read-SdxlChoices
     }
 
     $unsigned = New-Object Collections.Generic.List[string]
@@ -1676,10 +1817,14 @@ function Main {
         Write-Host "HTTPS, taille et SHA-256 seront vérifiés. Aucune mise à jour silencieuse ne sera effectuée."
         if (-not $AcceptUnsignedMvp -and -not (Confirm-YesNo "Continuer avec cette release non signée ?" $false)) { Fail "Installation annulée avant les gros téléchargements." }
     }
+    Write-Section "Configuration terminée — l'installation se poursuit sans autre question"
     Write-Section "Préflight matériel, disque, ports et réseau"; Run-Preflight $manifest $installRp $installPulid $installBackgrounds
     if ($installRp) { Install-RpBot $manifest $currentRp }
-    if ($installPulid) { Install-PuLID $manifest $currentPulid }
     if ($installBackgrounds) { Install-Backgrounds $manifest }
+    if ($installPulid) {
+        Install-StagedSdxlCheckpoint
+        Install-PuLID $manifest $currentPulid
+    }
     $installedLocal = Read-LocalManifest
     if ($null -ne $installedLocal.components.rpBot) {
         Write-UserLauncher $Root $installedLocal
