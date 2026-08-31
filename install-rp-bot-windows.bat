@@ -64,6 +64,7 @@ $script:TemporaryRoot = $null
 $script:Swap = $null
 $script:SdxlMode = "skip"
 $script:StagedSdxlCheckpoint = $null
+$script:SdxlStagingDirectory = $null
 
 function Fail([string]$Message) {
     throw $Message
@@ -748,12 +749,14 @@ function Read-SdxlChoices {
         return
     }
 
-    $stagingDirectory = Join-Path $script:TemporaryRoot "sdxl-checkpoint"
+    $stagingDirectory = Join-Path $Root "Modele SDXL temporaire"
     New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
+    $script:SdxlStagingDirectory = $stagingDirectory
     Write-Host ""
     Write-Host "Copiez un seul checkpoint SDXL .safetensors dans ce dossier temporaire :"
     Write-Host "  $stagingDirectory"
-    Write-Host "Placez-y une copie : ce dossier temporaire sera supprimé à la fin de l'installeur."
+    Write-Host "Placez-y une copie : le dépôt sera supprimé après son transfert vers PuLID_models."
+    Write-Host "Si une étape antérieure échoue, il restera dans RP Bot Suite pour la reprise."
     while ($true) {
         Read-Host "Appuyez sur Entrée lorsque la copie est terminée" | Out-Null
         $stagedCheckpoints = @(Get-SdxlCheckpoints $stagingDirectory)
@@ -768,6 +771,11 @@ function Read-SdxlChoices {
 
 function Install-StagedSdxlCheckpoint {
     if ([string]::IsNullOrWhiteSpace([string]$script:StagedSdxlCheckpoint)) { return }
+    $stagedParent = [IO.Directory]::GetParent([IO.Path]::GetFullPath([string]$script:StagedSdxlCheckpoint))
+    if ([string]::IsNullOrWhiteSpace([string]$script:SdxlStagingDirectory) -or $null -eq $stagedParent -or
+        -not (Test-NativePathEqual $stagedParent.FullName $script:SdxlStagingDirectory)) {
+        Fail "Le checkpoint SDXL temporaire ne provient pas du dossier géré par l'installeur."
+    }
     $checkpointsDirectory = Join-Path $ModelsRoot "checkpoints"
     New-Item -ItemType Directory -Path $checkpointsDirectory -Force | Out-Null
     $fileName = [IO.Path]::GetFileName([string]$script:StagedSdxlCheckpoint)
@@ -779,7 +787,11 @@ function Install-StagedSdxlCheckpoint {
         Move-Item -LiteralPath $temporaryDestination -Destination $destination
     }
     finally { Remove-Item -LiteralPath $temporaryDestination -Force -ErrorAction SilentlyContinue }
+    try { Remove-Item -LiteralPath $script:StagedSdxlCheckpoint -Force -ErrorAction Stop }
+    catch { Write-Warning "La copie temporaire SDXL n'a pas pu être supprimée : $($script:StagedSdxlCheckpoint)" }
+    Remove-Item -LiteralPath $script:SdxlStagingDirectory -Force -ErrorAction SilentlyContinue
     $script:StagedSdxlCheckpoint = $null
+    $script:SdxlStagingDirectory = $null
     Write-Host "Checkpoint SDXL copié : $destination"
 }
 
@@ -885,6 +897,8 @@ function Uninstall-RpBot([bool]$DeleteData) {
     Remove-ManagedFile (Join-Path $Root $script:UpdaterLauncherName) "rem RP_BOT_MANAGED_UPDATER_LAUNCHER" "lanceur de mise à jour RP Bot"
     $updateRequestPath = Join-Path $script:StateDirectory "update-request.json"
     if (Test-Path -LiteralPath $updateRequestPath) { Remove-Item -LiteralPath $updateRequestPath -Force }
+    $suiteControlPath = Join-Path $script:StateDirectory "suite-control.json"
+    if (Test-Path -LiteralPath $suiteControlPath) { Remove-Item -LiteralPath $suiteControlPath -Force }
     Remove-RpRuntimeFiles $keepPuLID
     $dataPath = Join-Path $Root "data\rp-bot"
     if ($DeleteData) {
@@ -1458,6 +1472,7 @@ function Invoke-SelfTest {
         $previousModelsRoot = $ModelsRoot
         $previousSdxlMode = $script:SdxlMode
         $previousStagedCheckpoint = $script:StagedSdxlCheckpoint
+        $previousSdxlStagingDirectory = $script:SdxlStagingDirectory
         $existingModelsRoot = Join-Path $selfTestRoot "sdxl-existing\PuLID_models"
         $existingCheckpoints = Join-Path $existingModelsRoot "checkpoints"
         New-Item -ItemType Directory -Path $existingCheckpoints -Force | Out-Null
@@ -1467,18 +1482,22 @@ function Invoke-SelfTest {
         Read-SdxlChoices
         if ($script:SdxlMode -ne "ask") { Fail "Self-test détection du checkpoint SDXL existant en échec." }
         $stagedModelsRoot = Join-Path $selfTestRoot "sdxl-staged\PuLID_models"
-        $stagedCheckpoint = Join-Path $selfTestRoot "custom.safetensors"
+        $stagingDirectory = Join-Path $selfTestRoot "Modele SDXL temporaire"
+        New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
+        $stagedCheckpoint = Join-Path $stagingDirectory "custom.safetensors"
         [IO.File]::WriteAllText($stagedCheckpoint, "custom")
         $script:ModelsRoot = $stagedModelsRoot
         $script:StagedSdxlCheckpoint = $stagedCheckpoint
+        $script:SdxlStagingDirectory = $stagingDirectory
         Install-StagedSdxlCheckpoint
         if (-not (Test-Path -LiteralPath (Join-Path $stagedModelsRoot "checkpoints\custom.safetensors") -PathType Leaf) -or
-            -not (Test-Path -LiteralPath $stagedCheckpoint -PathType Leaf)) {
+            (Test-Path -LiteralPath $stagedCheckpoint) -or (Test-Path -LiteralPath $stagingDirectory)) {
             Fail "Self-test copie temporaire du checkpoint SDXL en échec."
         }
         $script:ModelsRoot = $previousModelsRoot
         $script:SdxlMode = $previousSdxlMode
         $script:StagedSdxlCheckpoint = $previousStagedCheckpoint
+        $script:SdxlStagingDirectory = $previousSdxlStagingDirectory
         $script:StateDirectory = Join-Path $selfTestRoot "state"
         $script:LocalManifestPath = Join-Path $script:StateDirectory "installation.json"
         Write-LocalManifestAtomic ([pscustomobject]@{ marker = "first" })

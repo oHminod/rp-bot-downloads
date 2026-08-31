@@ -45,6 +45,7 @@ DOWNLOAD_DIRECTORY=""
 MANIFEST_PATH=""
 SDXL_MODE="skip"
 SDXL_STAGED_CHECKPOINT=""
+SDXL_STAGING_DIRECTORY=""
 
 die() {
   print -u2 -- "[ERREUR] $*"
@@ -1120,7 +1121,7 @@ prompt_yes_no() {
 
 collect_sdxl_choices() {
   local checkpoints_directory="${MODELS_ROOT}/checkpoints"
-  local staging_directory="${TEMPORARY_ROOT}/sdxl-checkpoint"
+  local staging_directory="${SUITE_ROOT}/Modele SDXL temporaire"
   local -a checkpoints staged_checkpoints
   checkpoints=("${checkpoints_directory}"/*.safetensors(N.))
   if (( ${#checkpoints[@]} > 0 )); then
@@ -1142,9 +1143,11 @@ collect_sdxl_choices() {
   fi
 
   /bin/mkdir -p "${staging_directory}" || die "Impossible de créer le dossier temporaire SDXL."
+  SDXL_STAGING_DIRECTORY="${staging_directory}"
   print -- "\nCopiez un seul checkpoint SDXL .safetensors dans ce dossier temporaire :"
   print -- "  ${staging_directory}"
-  print -- "Placez-y une copie : ce dossier temporaire sera supprimé à la fin de l'installeur."
+  print -- "Placez-y une copie : le dépôt sera supprimé après son transfert vers PuLID_models."
+  print -- "Si une étape antérieure échoue, il restera dans RP Bot Suite pour la reprise."
   while true; do
     read -r "REPLY?Appuyez sur Entrée lorsque la copie est terminée : "
     staged_checkpoints=("${staging_directory}"/*.safetensors(N.))
@@ -1159,6 +1162,8 @@ collect_sdxl_choices() {
 
 install_staged_sdxl_checkpoint() {
   [[ -n "${SDXL_STAGED_CHECKPOINT}" ]] || return
+  [[ -n "${SDXL_STAGING_DIRECTORY}" && "${SDXL_STAGED_CHECKPOINT:h:A}" == "${SDXL_STAGING_DIRECTORY:A}" ]] ||
+    die "Le checkpoint SDXL temporaire ne provient pas du dossier géré par l'installeur."
   local checkpoints_directory="${MODELS_ROOT}/checkpoints"
   local destination="${checkpoints_directory}/${SDXL_STAGED_CHECKPOINT:t}"
   local temporary_destination="${destination}.$$.tmp"
@@ -1173,7 +1178,12 @@ install_staged_sdxl_checkpoint() {
     /bin/rm -f -- "${temporary_destination}" 2>/dev/null || true
     die "Impossible d'activer le checkpoint SDXL ${destination}."
   }
+  if ! /bin/rm -f -- "${SDXL_STAGED_CHECKPOINT}"; then
+    print -u2 -- "[AVERTISSEMENT] La copie temporaire SDXL n'a pas pu être supprimée : ${SDXL_STAGED_CHECKPOINT}"
+  fi
+  /bin/rmdir -- "${SDXL_STAGING_DIRECTORY}" 2>/dev/null || true
   SDXL_STAGED_CHECKPOINT=""
+  SDXL_STAGING_DIRECTORY=""
   print -- "Checkpoint SDXL copié : ${destination}"
 }
 
@@ -1253,6 +1263,7 @@ uninstall_rp_bot() {
   remove_managed_file "${SUITE_ROOT}/${USER_LAUNCHER_NAME}" "# RP_BOT_MANAGED_LAUNCHER" "lanceur RP Bot"
   remove_managed_file "${SUITE_ROOT}/${UPDATER_LAUNCHER_NAME}" "# RP_BOT_MANAGED_UPDATER_LAUNCHER" "lanceur de mise à jour RP Bot"
   /bin/rm -f -- "${SUITE_ROOT}/state/update-request.json" 2>/dev/null || die "Impossible de supprimer la demande de mise à jour RP Bot."
+  /bin/rm -f -- "${SUITE_ROOT}/state/suite-control.json" 2>/dev/null || die "Impossible de supprimer la demande de contrôle RP Bot."
   remove_rp_runtime_files "$([[ "${current_pulid_type}" == "managed-local" ]] && print 1 || print 0)"
   if (( delete_data )); then
     if [[ -e "${data_path}" ]]; then
@@ -1717,10 +1728,11 @@ run_self_test() {
   compat_output="$(<"${compat_installer}.output")"
   [[ "${compat_output}" == $'compat-ok\n-e\n--sdxl\ndownload\n--accept-insightface-license' ]] || die "Self-test compatibilité Bash 3.2 PuLID développement en échec."
   /bin/rm -f -- "${compat_installer}" "${compat_installer}.output"
-  local previous_models_root previous_sdxl_mode previous_staged_checkpoint existing_models_root staged_models_root staged_checkpoint
+  local previous_models_root previous_sdxl_mode previous_staged_checkpoint previous_staging_directory existing_models_root staged_models_root staged_directory staged_checkpoint
   previous_models_root="${MODELS_ROOT}"
   previous_sdxl_mode="${SDXL_MODE}"
   previous_staged_checkpoint="${SDXL_STAGED_CHECKPOINT}"
+  previous_staging_directory="${SDXL_STAGING_DIRECTORY}"
   existing_models_root="${state_root}/sdxl-existing/PuLID_models"
   /bin/mkdir -p "${existing_models_root}/checkpoints"
   print -n -- existing > "${existing_models_root}/checkpoints/existing.safetensors"
@@ -1729,15 +1741,19 @@ run_self_test() {
   collect_sdxl_choices
   [[ "${SDXL_MODE}" == "ask" ]] || die "Self-test détection du checkpoint SDXL existant en échec."
   staged_models_root="${state_root}/sdxl-staged/PuLID_models"
-  staged_checkpoint="${state_root}/custom.safetensors"
+  staged_directory="${state_root}/Modele SDXL temporaire"
+  SDXL_STAGING_DIRECTORY="${staged_directory}"
+  /bin/mkdir -p "${SDXL_STAGING_DIRECTORY}"
+  staged_checkpoint="${SDXL_STAGING_DIRECTORY}/custom.safetensors"
   print -n -- custom > "${staged_checkpoint}"
   MODELS_ROOT="${staged_models_root}"
   SDXL_STAGED_CHECKPOINT="${staged_checkpoint}"
   install_staged_sdxl_checkpoint
-  [[ -f "${staged_models_root}/checkpoints/custom.safetensors" && -f "${staged_checkpoint}" ]] || die "Self-test copie temporaire du checkpoint SDXL en échec."
+  [[ -f "${staged_models_root}/checkpoints/custom.safetensors" && ! -e "${staged_checkpoint}" && ! -d "${staged_directory}" ]] || die "Self-test copie temporaire du checkpoint SDXL en échec."
   MODELS_ROOT="${previous_models_root}"
   SDXL_MODE="${previous_sdxl_mode}"
   SDXL_STAGED_CHECKPOINT="${previous_staged_checkpoint}"
+  SDXL_STAGING_DIRECTORY="${previous_staging_directory}"
   local swap_parent swap_target swap_prepared
   swap_parent="${state_root}/swap"
   swap_target="${swap_parent}/target"
