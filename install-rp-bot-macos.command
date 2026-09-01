@@ -1161,7 +1161,7 @@ collect_sdxl_choices() {
 }
 
 install_staged_sdxl_checkpoint() {
-  [[ -n "${SDXL_STAGED_CHECKPOINT}" ]] || return
+  [[ -n "${SDXL_STAGED_CHECKPOINT}" ]] || return 0
   [[ -n "${SDXL_STAGING_DIRECTORY}" && "${SDXL_STAGED_CHECKPOINT:h:A}" == "${SDXL_STAGING_DIRECTORY:A}" ]] ||
     die "Le checkpoint SDXL temporaire ne provient pas du dossier géré par l'installeur."
   local checkpoints_directory="${MODELS_ROOT}/checkpoints"
@@ -1733,6 +1733,8 @@ run_self_test() {
   previous_sdxl_mode="${SDXL_MODE}"
   previous_staged_checkpoint="${SDXL_STAGED_CHECKPOINT}"
   previous_staging_directory="${SDXL_STAGING_DIRECTORY}"
+  SDXL_STAGED_CHECKPOINT=""
+  install_staged_sdxl_checkpoint || die "Self-test installation PuLID sans checkpoint SDXL en échec."
   existing_models_root="${state_root}/sdxl-existing/PuLID_models"
   /bin/mkdir -p "${existing_models_root}/checkpoints"
   print -n -- existing > "${existing_models_root}/checkpoints/existing.safetensors"
