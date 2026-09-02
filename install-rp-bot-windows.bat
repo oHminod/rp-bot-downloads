@@ -1283,7 +1283,13 @@ function Write-UserLauncher([string]$SuiteRoot, $Local) {
         '  exit /b 1',
         ')',
         '"%~dp0apps\rp-bot\%RP_BOT_ACTIVE_VERSION%\runtime\node.exe" "%~dp0runtimes\rp-bot-suite\suite-launcher.mjs" --suite-root "%~dp0." %*',
-        'exit /b %ERRORLEVEL%',
+        'set "RP_BOT_LAUNCH_EXIT=%ERRORLEVEL%"',
+        'if not "%RP_BOT_LAUNCH_EXIT%"=="0" (',
+        '  echo.',
+        '  echo Le lancement de RP Bot a echoue. Consultez le message ci-dessus et logs\launcher.log.',
+        '  pause',
+        ')',
+        'exit /b %RP_BOT_LAUNCH_EXIT%',
         ''
     )
     $temporary = Join-Path $SuiteRoot (".rp-bot-launcher.{0}.tmp" -f [Guid]::NewGuid())
@@ -1603,7 +1609,9 @@ function Invoke-SelfTest {
         $launcherContents = [IO.File]::ReadAllText($launcherPath)
         if (-not $launcherContents.Contains('set "RP_BOT_DATA_DIR=%~dp0data\rp-bot"') -or
             -not $launcherContents.Contains('runtimes\rp-bot-suite\suite-launcher.mjs') -or
-            -not $launcherContents.Contains('--suite-root "%~dp0."')) {
+            -not $launcherContents.Contains('--suite-root "%~dp0."') -or
+            -not $launcherContents.Contains('set "RP_BOT_LAUNCH_EXIT=%ERRORLEVEL%"') -or
+            -not $launcherContents.Contains('pause')) {
             Fail "Self-test chemins relatifs du lanceur Windows en échec."
         }
         $launcherOutput = @(& $launcherPath --self-test 2>&1) -join "`n"
