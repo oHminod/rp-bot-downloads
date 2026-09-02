@@ -75,6 +75,25 @@ function Write-Section([string]$Message) {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
+function Write-InstallerHeader {
+    $logo = @'
+  ____  ____    ____        _     ____        _ _
+ |  _ \|  _ \  | __ )  ___| |_  / ___| _   _(_) |_ ___
+ | |_) | |_) | |  _ \ / _ \ __| \___ \| | | | | __/ _ \
+ |  _ <|  __/  | |_) | (_) | |_   ___) | |_| | | ||  __/
+ |_| \_\_|     |____/ \___/ \__| |____/ \__,_|_|\__\___|
+'@
+    Write-Host ""
+    Write-Host $logo -ForegroundColor Cyan
+    Write-Host "Bienvenue ! Cet assistant prépare ou met à jour votre environnement de roleplay local."
+    Write-Host ""
+    Write-Host "BON À SAVOIR" -ForegroundColor Yellow
+    Write-Host "PuLID ne sert pas seulement à générer des images : il fournit aussi les embeddings"
+    Write-Host "qui permettent à RP Bot d'indexer et de retrouver le lore, les souvenirs et les archives."
+    Write-Host "Il reste donc utile même si vous ne générez aucune image."
+    Write-Host ""
+}
+
 function Initialize-PermanentDirectories {
     foreach ($relativePath in @(
         "apps\rp-bot", "apps\pulid", "assets\roleplay-backgrounds",
@@ -1768,6 +1787,7 @@ function Main {
     if (($ConfirmUninstall -or $ConfirmDataDeletion -or $ConfirmModelsDeletion) -and -not $Uninstall) {
         Fail "Les confirmations de désinstallation exigent -Uninstall."
     }
+    Write-InstallerHeader
     if ($Uninstall) {
         Write-Host "Dossier de suite : $Root"
         Invoke-Uninstall

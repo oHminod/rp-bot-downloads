@@ -56,6 +56,33 @@ notice() {
   print -- "\n==> $*"
 }
 
+show_installer_header() {
+  local accent="" highlight="" reset=""
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    accent=$'\033[1;36m'
+    highlight=$'\033[1;33m'
+    reset=$'\033[0m'
+  fi
+
+  print -n -- "${accent}"
+  /bin/cat <<'RP_BOT_HEADER'
+  ____  ____    ____        _     ____        _ _
+ |  _ \|  _ \  | __ )  ___| |_  / ___| _   _(_) |_ ___
+ | |_) | |_) | |  _ \ / _ \ __| \___ \| | | | | __/ _ \
+ |  _ <|  __/  | |_) | (_) | |_   ___) | |_| | | ||  __/
+ |_| \_\_|     |____/ \___/ \__| |____/ \__,_|_|\__\___|
+RP_BOT_HEADER
+  print -n -- "${reset}"
+  print -- ""
+  print -- "Bienvenue ! Cet assistant prépare ou met à jour votre environnement de roleplay local."
+  print -- ""
+  print -- "${highlight}BON À SAVOIR${reset}"
+  print -- "PuLID ne sert pas seulement à générer des images : il fournit aussi les embeddings"
+  print -- "qui permettent à RP Bot d'indexer et de retrouver le lore, les souvenirs et les archives."
+  print -- "Il reste donc utile même si vous ne générez aucune image."
+  print -- ""
+}
+
 write_user_launcher() {
   local destination_directory="$1"
   local launcher_path="${destination_directory}/${USER_LAUNCHER_NAME}"
@@ -1818,6 +1845,7 @@ main() {
     run_self_test
     return
   fi
+  show_installer_header
   SUITE_ROOT="${SUITE_ROOT:A}"
   STATE_DIRECTORY="${SUITE_ROOT}/state"
   DOWNLOAD_DIRECTORY="${STATE_DIRECTORY}/downloads"
