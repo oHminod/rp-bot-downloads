@@ -315,6 +315,34 @@ python_path="${release_path}/.venv/bin/python"
 
 repair_portable_venv() {
   [[ -n "${previous_suite_root}" && "${previous_suite_root}" != "${SUITE_ROOT}" ]] || return 0
+  /usr/bin/osascript -l JavaScript - "${release_path}/.venv" "${previous_suite_root}" "${SUITE_ROOT}" <<'RUNTIME_JXA'
+ObjC.import("Foundation");
+function run(argv) {
+  const prefix = argv[1] + "/";
+  const rebase = value => typeof value === "string" && value.startsWith(prefix)
+    ? argv[2] + "/" + value.slice(prefix.length) : value;
+  function update(name, transform) {
+    const path = argv[0] + "/" + name;
+    if (!$.NSFileManager.defaultManager.fileExistsAtPath($(path))) return;
+    const value = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError($(path), $.NSUTF8StringEncoding, null));
+    if (value === undefined) throw new Error("Runtime illisible : " + path);
+    const updated = transform(value);
+    if (updated !== value && !$(updated).writeToFileAtomicallyEncodingError($(path), true, $.NSUTF8StringEncoding, null)) {
+      throw new Error("Écriture runtime impossible : " + path);
+    }
+  }
+  update("pulid-runtime.json", value => {
+    const state = JSON.parse(value);
+    state.project_root = rebase(state.project_root);
+    state.managed_python = rebase(state.managed_python);
+    return JSON.stringify(state, null, 2) + "\n";
+  });
+  update("pulid-python-path", value => rebase(value.replace(/[\r\n]+$/, "")) + "\n");
+}
+RUNTIME_JXA
+  [[ $? -eq 0 ]] || die "Impossible de recalculer les chemins du Python géré PuLID."
+  # The modern server owns pyvenv.cfg, executable links and editable paths.
+  [[ ! -f "${release_path}/.venv/pulid-runtime.json" ]] || return 0
   local configuration_path configuration_contents temporary mode target rebased_target temporary_link
   configuration_path="${release_path}/.venv/pyvenv.cfg"
   if [[ -f "${configuration_path}" ]]; then
@@ -351,6 +379,16 @@ if [[ "${1:-}" == "--self-test" ]]; then
 fi
 
 repair_portable_venv
+if [[ -f "${release_path}/scripts/prepare_runtime_macos.sh" ]]; then
+  if [[ "${PULID_LAUNCH_MODE}" == "local" ]]; then
+    for argument in "$@"; do
+      [[ "${argument}" != "--network" ]] || die "Le mode réseau est réservé au lanceur PuLID réseau."
+    done
+    exec /usr/bin/env "PULID_MODELS_ROOT=${models_path}" /bin/bash "${release_path}/start_pulid_server.sh" "$@"
+  fi
+  print -- "[AVERTISSEMENT] Mode réseau avancé : PuLID écoutera sur le LAN."
+  exec /usr/bin/env "PULID_MODELS_ROOT=${models_path}" /bin/bash "${release_path}/start_pulid_server.sh" --network "$@"
+fi
 [[ -x "${python_path}" ]] || die "Runtime Python PuLID actif introuvable : ${python_path}"
 if [[ "${PULID_LAUNCH_MODE}" == "local" ]]; then
   for argument in "$@"; do
@@ -920,7 +958,11 @@ assert_allowed_url() {
     manifest|rp-bot|roleplay-backgrounds)
       [[ "${url}" == https://github.com/oHminod/rp-bot-downloads/releases/download/* ]]
       ;;
-    pulid) [[ "${url}" == https://github.com/oHminod/PuLID/releases/download/* ]] ;;
+    pulid)
+      # Accepter aussi les manifestes publiés avant le renommage du dépôt.
+      [[ "${url}" == https://github.com/oHminod/rp-bot-server/releases/download/* ||
+         "${url}" == https://github.com/oHminod/PuLID/releases/download/* ]]
+      ;;
     signature) [[ "${url}" == https://github.com/* || "${url}" == https://raw.githubusercontent.com/* ]] ;;
     *) return 1 ;;
   esac || die "Hôte ou chemin de téléchargement non autorisé pour ${component}: ${url}"
@@ -1477,7 +1519,6 @@ prepare_preflight() {
   if (( install_pulid )); then
     require_connectivity "Hugging Face" "https://huggingface.co/"
     require_connectivity Astral/uv "https://astral.sh/uv/install.sh"
-    require_connectivity "llama-cpp-python Metal" "https://abetlen.github.io/llama-cpp-python/whl/metal"
     require_connectivity PyPI "https://pypi.org/simple"
   fi
   local -a selected_components
@@ -1522,12 +1563,15 @@ install_rp_bot() {
 }
 
 create_pulid_bash32_compat_installer() {
-  local release_root="$1" source_path compat_path line array_replacements=0 prompt_replacements=0
+  local release_root="$1" source_path compat_path line array_replacements=0 prompt_replacements=0 managed_runtime_calls=0
   source_path="${release_root}/install_macos.sh"
   compat_path="${release_root}/.rp-bot-install-macos-compat.sh"
   [[ -f "${source_path}" ]] || die "Installateur macOS PuLID absent."
   : > "${compat_path}" || die "Impossible de préparer la compatibilité Bash 3.2 pour PuLID."
   while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" == '"${MANAGED_PYTHON}" -I "${PROJECT_DIR}/scripts/install_environment.py" \' ]]; then
+      managed_runtime_calls=$(( managed_runtime_calls + 1 ))
+    fi
     if [[ "${line}" == '  "${PULID_EDITABLE_ARGS[@]}" \' ]]; then
       print -r -- '  ${PULID_EDITABLE_ARGS[@]+"${PULID_EDITABLE_ARGS[@]}"} \' >> "${compat_path}"
       array_replacements=$(( array_replacements + 1 ))
@@ -1539,7 +1583,7 @@ create_pulid_bash32_compat_installer() {
       print -r -- "${line}" >> "${compat_path}"
     fi
   done < "${source_path}"
-  if (( array_replacements != 1 || prompt_replacements != 1 )); then
+  if (( prompt_replacements != 1 || ! ((array_replacements == 1 && managed_runtime_calls == 0) || (array_replacements == 0 && managed_runtime_calls == 1)) )); then
     /bin/rm -f -- "${compat_path}"
     die "L'adaptateur non interactif Bash 3.2 ne correspond pas exactement à l'installateur PuLID attendu ; aucune exécution effectuée."
   fi

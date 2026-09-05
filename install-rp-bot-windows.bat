@@ -254,6 +254,37 @@ try {
     $previousRoot = [IO.Path]::GetFullPath($PreviousSuiteRoot).TrimEnd($pathSeparators)
     $currentRoot = [IO.Path]::GetFullPath($SuiteRoot).TrimEnd($pathSeparators)
     if ([string]::Equals($previousRoot, $currentRoot, [StringComparison]::OrdinalIgnoreCase)) { exit 0 }
+    function Rebase-OwnedPath([string]$Value) {
+        $normalized = $Value.Replace('/', '\')
+        $prefix = $previousRoot.Replace('/', '\') + '\'
+        if ($normalized.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            return $currentRoot + '\' + $normalized.Substring($prefix.Length)
+        }
+        return $Value
+    }
+    function Write-RuntimeText([string]$Path, [string]$Value) {
+        if ([IO.File]::ReadAllText($Path) -eq $Value) { return }
+        $temporary = "$Path.$([Guid]::NewGuid()).tmp"
+        $backup = "$temporary.bak"
+        try {
+            [IO.File]::WriteAllText($temporary, $Value, (New-Object Text.UTF8Encoding($false)))
+            [IO.File]::Replace($temporary, $Path, $backup)
+        } finally { Remove-Item -LiteralPath $temporary, $backup -Force -ErrorAction SilentlyContinue }
+    }
+    $statePath = Join-Path $VenvPath 'pulid-runtime.json'
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        $state = [IO.File]::ReadAllText($statePath) | ConvertFrom-Json
+        foreach ($field in @('project_root', 'managed_python')) {
+            $state.$field = Rebase-OwnedPath $state.$field
+        }
+        Write-RuntimeText $statePath (($state | ConvertTo-Json -Depth 10) + "`n")
+    }
+    $pointer = Join-Path $VenvPath 'pulid-python-path'
+    if (Test-Path -LiteralPath $pointer -PathType Leaf) {
+        Write-RuntimeText $pointer ((Rebase-OwnedPath ([IO.File]::ReadAllText($pointer).TrimEnd("`r", "`n"))) + "`n")
+    }
+    # The modern server owns pyvenv.cfg and its CPython redirectors.
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) { exit 0 }
     $configurationPath = Join-Path ([IO.Path]::GetFullPath($VenvPath)) "pyvenv.cfg"
     if (-not (Test-Path -LiteralPath $configurationPath -PathType Leaf)) { exit 0 }
     $contents = [IO.File]::ReadAllText($configurationPath)
@@ -492,7 +523,13 @@ function Assert-AllowedUrl([string]$Component, [string]$Url) {
         "manifest" { $valid = $uri.Host -eq "github.com" -and $uri.AbsolutePath.StartsWith("/oHminod/rp-bot-downloads/releases/download/") }
         "rp-bot" { $valid = $uri.Host -eq "github.com" -and $uri.AbsolutePath.StartsWith("/oHminod/rp-bot-downloads/releases/download/") }
         "roleplay-backgrounds" { $valid = $uri.Host -eq "github.com" -and $uri.AbsolutePath.StartsWith("/oHminod/rp-bot-downloads/releases/download/") }
-        "pulid" { $valid = $uri.Host -eq "github.com" -and $uri.AbsolutePath.StartsWith("/oHminod/PuLID/releases/download/") }
+        "pulid" {
+            # Accepter aussi les manifestes publiés avant le renommage du dépôt.
+            $valid = $uri.Host -eq "github.com" -and (
+                $uri.AbsolutePath.StartsWith("/oHminod/rp-bot-server/releases/download/") -or
+                $uri.AbsolutePath.StartsWith("/oHminod/PuLID/releases/download/")
+            )
+        }
         "signature" { $valid = $uri.Host -in @("github.com", "raw.githubusercontent.com") }
     }
     if (-not $valid) { Fail "Hôte ou chemin de téléchargement non autorisé pour $Component : $Url" }
@@ -1106,7 +1143,6 @@ function Run-Preflight($Manifest, [bool]$InstallRp, [bool]$InstallPulid, [bool]$
         Require-Connectivity "Hugging Face" "https://huggingface.co/"
         Require-Connectivity "PyTorch CUDA 13" "https://download.pytorch.org/whl/cu130"
         Require-Connectivity "Astral/uv" "https://astral.sh/uv/install.ps1"
-        Require-Connectivity "llama-cpp-python CUDA 13" "https://abetlen.github.io/llama-cpp-python/whl/cu130"
         Require-Connectivity "PyPI" "https://pypi.org/simple"
     }
     $selected = @()
@@ -1145,6 +1181,11 @@ function New-PuLIDWindowsCompatInstaller([string]$ReleaseRoot) {
     $expected = '"%PROJECT_DIR%.venv\Scripts\pulid-install.exe" --models-root "%PULID_MODELS_ROOT%" --sdxl ask'
     $replacement = '"%PROJECT_DIR%.venv\Scripts\pulid-install.exe" --models-root "%PULID_MODELS_ROOT%" --sdxl "%PULID_SDXL_MODE%" --accept-insightface-license'
     $contents = [IO.File]::ReadAllText($sourcePath)
+    $managedCall = '"%VENV_PYTHON%" -I -m pulid_app.installer --models-root "%PULID_MODELS_ROOT%" --sdxl ask'
+    if ($contents.Contains($managedCall)) {
+        $expected = $managedCall
+        $replacement = '"%VENV_PYTHON%" -I -m pulid_app.installer --models-root "%PULID_MODELS_ROOT%" --sdxl "%PULID_SDXL_MODE%" --accept-insightface-license'
+    }
     $first = $contents.IndexOf($expected, [StringComparison]::Ordinal)
     $last = $contents.LastIndexOf($expected, [StringComparison]::Ordinal)
     if ($first -lt 0 -or $first -ne $last) { Fail "L'adaptateur non interactif Windows ne correspond pas exactement à l'installateur PuLID attendu ; aucune exécution effectuée." }
@@ -1427,10 +1468,15 @@ function Write-PuLIDLaunchers([string]$SuiteRoot, $Local) {
             ')',
             'set "PULID_PROJECT_ROOT=%PULID_RELEASE%"',
             'set "PULID_MODELS_ROOT=%PULID_MODELS_PATH%"',
+            $(if ($launcher.Mode -eq "local") { 'for %%A in (%*) do if /i "%%~A"=="--network" ( echo [ERREUR] Utilisez Lancer PuLID reseau.bat pour le mode reseau. & exit /b 1 )' } else { 'echo [AVERTISSEMENT] Le port 12693 doit rester limite a un reseau de confiance.' }),
+            'if not exist "%PULID_RELEASE%\scripts\prepare_runtime_windows.ps1" goto pulid_legacy',
+            ('call "%PULID_RELEASE%\start_windows.bat" ' + $launcher.NetworkArgument + '%*'),
+            # Expand ERRORLEVEL after CALL, outside a parenthesized block, and return it explicitly to PowerShell.
+            'exit /b %ERRORLEVEL%',
+            ':pulid_legacy',
             'set "VIRTUAL_ENV=%PULID_RELEASE%\.venv"',
             'set "PULID_TORCH_DLL_DIR=%PULID_RELEASE%\.venv\Lib\site-packages\torch\lib"',
             'set "PATH=%PULID_TORCH_DLL_DIR%;%VIRTUAL_ENV%\Scripts;%PATH%"',
-            $(if ($launcher.Mode -eq "local") { 'for %%A in (%*) do if /i "%%~A"=="--network" ( echo [ERREUR] Utilisez Lancer PuLID reseau.bat pour le mode reseau. & exit /b 1 )' } else { 'echo [AVERTISSEMENT] Le port 12693 doit rester limite a un reseau de confiance.' }),
             ('"%PULID_PYTHON%" -m pulid_app.server --host 127.0.0.1 --port 12693 --device cuda --dtype float16 --offload none ' + $launcher.NetworkArgument + '%*'),
             'exit /b %ERRORLEVEL%',
             ''
@@ -1669,6 +1715,39 @@ function Invoke-SelfTest {
         if ($movedVenvConfiguration.IndexOf($movedRoot, [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
             $movedVenvConfiguration.IndexOf($selfTestRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
             Fail "Self-test recalage de pyvenv.cfg Windows en échec."
+        }
+        # Exercise the modern delegation branch with a recorder, without Python or models.
+        $movedServer = Split-Path -Parent $movedVenv
+        New-Item -ItemType Directory -Path (Join-Path $movedServer "scripts"), (Join-Path $movedVenv "Scripts") -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $movedServer "scripts\prepare_runtime_windows.ps1"), "# fixture")
+        [IO.File]::WriteAllText((Join-Path $movedVenv "Scripts\python.exe"), "fixture; never executed")
+        [IO.File]::WriteAllText((Join-Path $movedVenv "pulid-runtime.json"), (@{
+            project_root = (Join-Path $selfTestRoot "apps\pulid\0.1.0")
+            managed_python = (Join-Path $fixturePythonHome "python.exe")
+            lock_sha256 = "unchanged"
+        } | ConvertTo-Json))
+        [IO.File]::WriteAllText((Join-Path $movedVenv "pulid-python-path"), (Join-Path $fixturePythonHome "python.exe"))
+        foreach ($expectedExitCode in @(23, 0)) {
+            [IO.File]::WriteAllText((Join-Path $movedServer "start_windows.bat"), "@echo off`r`necho MODELS=%PULID_MODELS_ROOT%`r`necho ARGS=%*`r`nexit /b $expectedExitCode`r`n")
+            foreach ($entry in @($script:PuLIDLocalLauncherName, $script:PuLIDNetworkLauncherName)) {
+                $delegated = @(& (Join-Path $movedRoot $entry) --probe "value with spaces" 2>&1) -join "`n"
+                $delegatedExitCode = $LASTEXITCODE
+                $delegationErrors = @()
+                if ($delegatedExitCode -ne $expectedExitCode) { $delegationErrors += "Code de sortie attendu : $expectedExitCode ; reçu : $delegatedExitCode." }
+                if ($delegated -notlike "*MODELS=$movedRoot\models\PuLID_models*") { $delegationErrors += "Chemin des modèles déplacés incorrect." }
+                if ($delegated -notlike '*--probe "value with spaces"*') { $delegationErrors += "Argument contenant des espaces altéré." }
+                if ($delegated.Contains('--network') -ne ($entry -eq $script:PuLIDNetworkLauncherName)) { $delegationErrors += "Mode réseau incorrect." }
+                if ($delegationErrors.Count -gt 0) {
+                    Fail ("Self-test délégation au lanceur serveur Windows en échec. Lanceur : $entry.`r`n" + ($delegationErrors -join "`r`n") + "`r`n" + $delegated)
+                }
+            }
+        }
+        $movedState = [IO.File]::ReadAllText((Join-Path $movedVenv "pulid-runtime.json")) | ConvertFrom-Json
+        $expectedPython = (Join-Path $fixturePythonHome "python.exe").Replace($selfTestRoot, $movedRoot)
+        if ($movedState.project_root -ne $movedServer -or $movedState.managed_python -ne $expectedPython -or
+            $movedState.lock_sha256 -ne "unchanged" -or
+            [IO.File]::ReadAllText((Join-Path $movedVenv "pulid-python-path")).Trim() -ne $expectedPython) {
+            Fail "Self-test déplacement du Python géré Windows en échec."
         }
         $movedUpdaterLauncher = Join-Path $movedRoot $script:UpdaterLauncherName
         $movedUpdaterOutput = @(& $movedUpdaterLauncher --self-test 2>&1) -join "`n"
