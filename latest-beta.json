@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
   "channel": "beta",
-  "updatedAt": "2026-09-13T21:47:37.000Z",
-  "suiteVersion": "0.2.0-beta.24",
+  "updatedAt": "2026-09-13T23:05:56.000Z",
+  "suiteVersion": "0.2.0-beta.25",
   "manifest": {
-    "fileName": "rp-bot-suite-manifest-0.2.0-beta.24.json",
-    "url": "https://github.com/oHminod/rp-bot-downloads/releases/download/v0.2.0-beta.24/rp-bot-suite-manifest-0.2.0-beta.24.json",
+    "fileName": "rp-bot-suite-manifest-0.2.0-beta.25.json",
+    "url": "https://github.com/oHminod/rp-bot-downloads/releases/download/v0.2.0-beta.25/rp-bot-suite-manifest-0.2.0-beta.25.json",
     "sizeBytes": 6773,
-    "sha256": "b92350455c794894b5cb5456b9f18c33dfe2796fdf566bc33f680dfec11a2d70",
+    "sha256": "8dd8d4fc81cfa6919772151c76bcfd84816123ca9734a7abf7101e9f4abcc06a",
     "signature": {
       "status": "unsigned-mvp",
       "reason": "Prerelease MVP non signée : confirmation explicite requise avant installation."
