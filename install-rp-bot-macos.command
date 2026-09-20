@@ -1591,6 +1591,25 @@ create_pulid_bash32_compat_installer() {
   REPLY="${compat_path}"
 }
 
+prepare_pulid_model_folders() {
+  local prepared="$1" previous_root="$2" defaults="${1}/config/default.yaml"
+  [[ -f "${defaults}" ]] || return 0
+  if [[ ! -e "${prepared}/config/local.yaml" && -f "${previous_root}/config/local.yaml" ]]; then
+    /bin/cp "${previous_root}/config/local.yaml" "${prepared}/config/local.yaml" || die "Impossible de conserver la configuration locale RP-Bot-Server."
+    /bin/chmod 600 "${prepared}/config/local.yaml"
+  fi
+  # Only change archive defaults; pulid-install preserves the local krea2 section.
+  local keep_krea=0 keep_qwen=0
+  [[ -e "${MODELS_ROOT}/krea2/checkpoints" ]] && keep_krea=1
+  [[ -e "${MODELS_ROOT}/text_encoders/qwen3vl" ]] && keep_qwen=1
+  /usr/bin/awk -v keep_krea="${keep_krea}" -v keep_qwen="${keep_qwen}" '
+    !keep_krea { gsub(/krea2\/checkpoints\//, "krea/") }
+    !keep_qwen { gsub(/text_encoders\/qwen3vl\//, "qwen/") }
+    { print }
+  ' "${defaults}" > "${defaults}.tmp" || die "Impossible de préparer les dossiers Krea et Qwen."
+  /bin/mv "${defaults}.tmp" "${defaults}" || die "Impossible de configurer les dossiers Krea et Qwen."
+}
+
 install_pulid() {
   local summary="$1" current_version="$2"
   local version file_name url size sha sig_status sig_url archive staging prepared target operation_kind compat_installer
@@ -1611,6 +1630,7 @@ install_pulid() {
   single_archive_root "${staging}"; prepared="${REPLY}"
   [[ -f "${prepared}/pyproject.toml" && -f "${prepared}/install_production_macos.sh" && -f "${prepared}/install_macos.sh" ]] || die "Archive PuLID incomplète : installateur production absent."
   /bin/chmod +x "${prepared}/install_production_macos.sh" "${prepared}/install_macos.sh"
+  prepare_pulid_model_folders "${prepared}" "${SUITE_ROOT}/apps/pulid/${current_version:-not-installed}"
   target="${SUITE_ROOT}/apps/pulid/${version}"
   swap_in_directory "${prepared}" "${target}" "${staging}"
   create_pulid_bash32_compat_installer "${target}"
@@ -1962,11 +1982,12 @@ main() {
       MODELS_ROOT="$(json_get "${local_summary}" modelsPath || true)"
     fi
     if [[ -z "${MODELS_ROOT}" ]]; then
-      local default_models="${SUITE_ROOT}/models/PuLID_models" answer
+      local default_models="${SUITE_ROOT}/models" answer
+      [[ -d "${SUITE_ROOT}/models/PuLID_models" ]] && default_models="${SUITE_ROOT}/models/PuLID_models"
       if prompt_yes_no "Utiliser ${default_models} pour les modèles PuLID ?" yes; then
         MODELS_ROOT="${default_models}"
       else
-        read -r "answer?Chemin absolu du dossier PuLID_models (SSD externe accepté) : "
+        read -r "answer?Chemin absolu du dossier de modèles (SSD externe accepté) : "
         [[ "${answer}" == /* ]] || die "Le dossier de modèles doit être absolu."
         MODELS_ROOT="${answer}"
       fi

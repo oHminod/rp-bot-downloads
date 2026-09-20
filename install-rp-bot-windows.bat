@@ -1211,6 +1211,21 @@ function Invoke-CmdWithoutInput([string]$BatchPath) {
     finally { $process.Dispose() }
 }
 
+function Initialize-PuLIDModelFolders([string]$Prepared, [string]$PreviousRoot) {
+    $defaults = Join-Path $Prepared "config\default.yaml"
+    if (-not (Test-Path -LiteralPath $defaults -PathType Leaf)) { return }
+    $localConfig = Join-Path $Prepared "config\local.yaml"
+    $previousConfig = Join-Path $PreviousRoot "config\local.yaml"
+    if (-not (Test-Path -LiteralPath $localConfig) -and (Test-Path -LiteralPath $previousConfig -PathType Leaf)) {
+        Copy-Item -LiteralPath $previousConfig -Destination $localConfig
+    }
+    # Only change archive defaults; pulid-install preserves the local krea2 section.
+    $contents = [IO.File]::ReadAllText($defaults)
+    if (-not (Test-Path -LiteralPath (Join-Path $ModelsRoot "krea2\checkpoints"))) { $contents = $contents.Replace("krea2/checkpoints/", "krea/") }
+    if (-not (Test-Path -LiteralPath (Join-Path $ModelsRoot "text_encoders\qwen3vl"))) { $contents = $contents.Replace("text_encoders/qwen3vl/", "qwen/") }
+    [IO.File]::WriteAllText($defaults, $contents, (New-Object Text.UTF8Encoding($false)))
+}
+
 function Install-PuLID($Manifest, [string]$CurrentVersion) {
     $version = $Manifest.pulid.compatibleVersion; $artifact = Get-Artifact $Manifest "pulid"; $kind = if (-not $CurrentVersion) { "install" } elseif ($CurrentVersion -eq $version) { "repair" } else { "update" }
     Set-InterruptedOperation $kind "pulid" "downloading" $CurrentVersion $version "Téléchargement PuLID en cours."
@@ -1219,6 +1234,8 @@ function Install-PuLID($Manifest, [string]$CurrentVersion) {
     $staging = Join-Path $Root ("apps\pulid\.staging." + [Guid]::NewGuid()); Expand-SafeArchive $archive $staging
     $prepared = Get-SingleArchiveRoot $staging
     foreach ($required in @("pyproject.toml", "install_production_windows.bat", "install_windows.bat", "start_windows.bat")) { if (-not (Test-Path -LiteralPath (Join-Path $prepared $required) -PathType Leaf)) { Fail "Archive PuLID incomplète : $required" } }
+    $previousRoot = Join-Path $Root ("apps\pulid\" + $(if ($CurrentVersion) { $CurrentVersion } else { "not-installed" }))
+    Initialize-PuLIDModelFolders $prepared $previousRoot
     $target = Join-Path $Root "apps\pulid\$version"; Start-DirectorySwap $prepared $target $staging
     $previousModels = $env:PULID_MODELS_ROOT
     $previousSdxlMode = $env:PULID_SDXL_MODE
@@ -1923,9 +1940,10 @@ function Main {
     if ($installPulid) {
         if (-not $ModelsRoot -and $null -ne $local.components.pulid) { $script:ModelsRoot = Get-PortableModelsPath $local }
         if (-not $ModelsRoot) {
-            $defaultModels = Join-Path $Root "models\PuLID_models"
+            $defaultModels = Join-Path $Root "models"
+            if (Test-Path -LiteralPath (Join-Path $defaultModels "PuLID_models") -PathType Container) { $defaultModels = Join-Path $defaultModels "PuLID_models" }
             if (Confirm-YesNo "Utiliser $defaultModels pour les modèles PuLID ?" $true) { $script:ModelsRoot = $defaultModels }
-            else { $script:ModelsRoot = Read-Host "Chemin absolu du dossier PuLID_models (SSD externe accepté)" }
+            else { $script:ModelsRoot = Read-Host "Chemin absolu du dossier de modèles (SSD externe accepté)" }
         }
         if (-not [IO.Path]::IsPathRooted($ModelsRoot)) { Fail "Le dossier de modèles doit être absolu." }
         Write-Host ""; Write-Host "Licence InsightFace/AntelopeV2 : poids réservés à la recherche non commerciale."
