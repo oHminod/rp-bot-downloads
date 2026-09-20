@@ -1184,7 +1184,8 @@ function New-PuLIDWindowsCompatInstaller([string]$ReleaseRoot) {
     $managedCall = '"%VENV_PYTHON%" -I -m pulid_app.installer --models-root "%PULID_MODELS_ROOT%" --sdxl ask'
     if ($contents.Contains($managedCall)) {
         $expected = $managedCall
-        $replacement = '"%VENV_PYTHON%" -I -m pulid_app.installer --models-root "%PULID_MODELS_ROOT%" --sdxl "%PULID_SDXL_MODE%" --accept-insightface-license'
+        # -I ignores Python encoding environment variables, including in redirected logs.
+        $replacement = '"%VENV_PYTHON%" -I -X utf8 -m pulid_app.installer --models-root "%PULID_MODELS_ROOT%" --sdxl "%PULID_SDXL_MODE%" --accept-insightface-license'
     }
     $first = $contents.IndexOf($expected, [StringComparison]::Ordinal)
     $last = $contents.LastIndexOf($expected, [StringComparison]::Ordinal)
